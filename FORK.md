@@ -81,14 +81,16 @@ need no Home Assistant install: `tests/stub.py` fabricates the modules the code
 imports. Run them after every merge.
 
 They do not talk to a car. These need a vehicle and are worth repeating after a
-merge that touches the command path:
+merge that touches the command path. All but the last were confirmed on
+24 August 2026:
 
-1. the entities read back the programs the car holds
-2. writing a slot is accepted, `command_status` reaching Complete
-3. the written program appears in the entities within a poll or two
-4. a two slot batch write leaves both slots set
-5. the clear button empties all four
-6. driving off clears the slots by itself
+1. the entities read back the programs the car holds, confirmed
+2. writing a slot is accepted, `command_status` reaching Complete, confirmed
+3. the written program appears in the entities within a poll or two, confirmed
+4. a two slot batch write leaves both slots set, confirmed. Two separate commands
+   a second apart do not, which is why the batch exists
+5. the clear button empties all four, confirmed
+6. driving off clears the slots by itself, not yet seen
 
 ## Known unknowns
 
