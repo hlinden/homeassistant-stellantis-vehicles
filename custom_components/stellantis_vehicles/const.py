@@ -141,6 +141,11 @@ PRECONDITIONING_PROGRAM_DISABLED_MINUTE = 7
 # preconditioning is on.
 PRECONDITIONING_PROGRAM_ASAP = "deactivate"
 
+# The vehicle needs a while to report a program back. Until it does, or until
+# this many seconds pass, get_programs() answers with what was last written, so
+# that two writes in a row do not build their payloads from the same stale data.
+PRECONDITIONING_PROGRAMS_OVERRIDE_TTL = 300
+
 SERVICE_SET_PRECONDITIONING_PROGRAM = "set_preconditioning_program"
 
 VEHICLE_TYPE_ELECTRIC = "Electric"

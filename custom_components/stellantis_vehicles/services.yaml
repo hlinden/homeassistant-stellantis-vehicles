@@ -1,9 +1,10 @@
 set_preconditioning_program:
   name: Set preconditioning program
   description: >-
-    Writes one of the four preconditioning program slots of a vehicle. Fields left
-    empty keep the value currently stored in the vehicle. The command is refused
-    while preconditioning is running.
+    Writes preconditioning program slots of a vehicle. Fields left empty keep the
+    current value, which after a recent write is the value that was written rather
+    than the older one the vehicle is still reporting. The command is refused while
+    preconditioning is running.
   fields:
     device_id:
       name: Vehicle
@@ -15,8 +16,10 @@ set_preconditioning_program:
           multiple: true
     slot:
       name: Slot
-      description: Program slot to write, 1 to 4. The slots are the same ones shown in the vehicle app.
-      required: true
+      description: >-
+        Program slot to write, 1 to 4. The slots are the same ones shown in the
+        vehicle app. Leave this out when using the programs field.
+      required: false
       example: 1
       selector:
         number:
@@ -53,3 +56,12 @@ set_preconditioning_program:
       example: true
       selector:
         boolean:
+    programs:
+      name: Programs
+      description: >-
+        Several slots at once, each with slot, days, time and enabled. They are
+        written in one command, so either all of them are stored or none. Use this
+        instead of the fields above when the slots belong together.
+      example: '[{"slot": 1, "days": ["Mon"], "time": "07:30:00", "enabled": true}]'
+      selector:
+        object:

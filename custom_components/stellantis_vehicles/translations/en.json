@@ -401,6 +401,9 @@
     "preconditioning_program_days_missing": {
       "message": "Select at least one day before enabling this preconditioning program."
     },
+    "preconditioning_program_slot_missing": {
+      "message": "Give either a slot, or a list of programs."
+    },
     "preconditioning_program_invalid_day": {
       "message": "\"{day}\" is not a valid day, use one of: {days}."
     },

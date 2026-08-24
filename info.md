@@ -208,7 +208,7 @@ actions:
       enabled: true
 ```
 
-Fields left out of the call keep the value currently stored in the vehicle.
+Fields left out of the call keep the current value. Slots that belong together, such as a pair covering an hour, should go in one call with the `programs` field: they are then written in a single command, and the vehicle does not reliably act on a second command sent moments after the first.
 
 ## Battery capacity / residual sensors
 Thanks to the community ([#272](https://github.com/andreadegiovine/homeassistant-stellantis-vehicles/issues/272)), it seems that for some vehicles **Stellantis provides incorrect values**. The **switch.battery_values_correction** entity (in your language) applies a correction if active.

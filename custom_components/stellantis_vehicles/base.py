@@ -31,7 +31,8 @@ from .const import (
     PRECONDITIONING_PROGRAM_ASAP,
     PRECONDITIONING_PROGRAM_SLOTS,
     PRECONDITIONING_PROGRAM_DISABLED_HOUR,
-    PRECONDITIONING_PROGRAM_DISABLED_MINUTE
+    PRECONDITIONING_PROGRAM_DISABLED_MINUTE,
+    PRECONDITIONING_PROGRAMS_OVERRIDE_TTL
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,6 +54,8 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
 #        self._total_trip = None
         self._manage_charge_limit_sent = False
         self._dropped_programs = set()
+        self._programs_override = None
+        self._programs_override_at = None
 
         if self._stellantis.logger_filter:
             _LOGGER.addFilter(self._stellantis.logger_filter)
@@ -235,6 +238,13 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                             # such a program is deleted the next time any of them is sent.
                             self._dropped_programs.add(program.get("slot"))
                             _LOGGER.warning("Preconditioning program %s of vehicle '%s' has no weekday recurrence or no start time and cannot be read, it will be deleted by the next preconditioning command: %s", program.get("slot"), self._vehicle["vin"], program)
+        if self._programs_override:
+            expired = (get_datetime() - self._programs_override_at).total_seconds() > PRECONDITIONING_PROGRAMS_OVERRIDE_TTL
+            if expired or default_programs == self._programs_override:
+                self._programs_override = None
+                self._programs_override_at = None
+            else:
+                return deepcopy(self._programs_override)
         return default_programs
 
     async def send_preconditioning_command(self, button_name, action):
@@ -242,30 +252,39 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": action, "programs": self.get_programs()})
 
     async def send_preconditioning_program(self, button_name, slot, day, hour, minute, on):
-        """ Write one preconditioning program slot to the vehicle.
+        """ Write one preconditioning program slot to the vehicle. """
+        await self.send_preconditioning_programs(button_name, [(slot, day, hour, minute, on)])
 
-        The vehicle stores all four slots in a single payload, so the other three
-        are read back and posted unchanged.
+    async def send_preconditioning_programs(self, button_name, updates):
+        """ Write preconditioning program slots to the vehicle.
+
+        The vehicle stores all four slots in a single payload, so the slots that
+        are not being written are read back and posted unchanged. Several slots
+        are written in one command rather than one command each: the vehicle does
+        not reliably act on a second command sent moments after the first.
         """
         if self.preconditioning_is_running:
-            _LOGGER.warning("Preconditioning is running on vehicle '%s', program %s was not written", self._vehicle["vin"], slot)
+            _LOGGER.warning("Preconditioning is running on vehicle '%s', the programs were not written", self._vehicle["vin"])
             raise ServiceValidationError(
                 translation_domain = DOMAIN,
                 translation_key = "preconditioning_program_running"
             )
-        if on and preconditioning_program_time({"hour": hour, "minute": minute}) is None:
-            raise ServiceValidationError(
-                translation_domain = DOMAIN,
-                translation_key = "preconditioning_program_time_missing"
-            )
-        if on and not any(day):
-            raise ServiceValidationError(
-                translation_domain = DOMAIN,
-                translation_key = "preconditioning_program_days_missing"
-            )
         programs = self.get_programs()
-        programs[f"program{slot}"] = {"day": day, "hour": hour, "minute": minute, "on": int(on)}
+        for slot, day, hour, minute, on in updates:
+            if on and preconditioning_program_time({"hour": hour, "minute": minute}) is None:
+                raise ServiceValidationError(
+                    translation_domain = DOMAIN,
+                    translation_key = "preconditioning_program_time_missing"
+                )
+            if on and not any(day):
+                raise ServiceValidationError(
+                    translation_domain = DOMAIN,
+                    translation_key = "preconditioning_program_days_missing"
+                )
+            programs[f"program{slot}"] = {"day": day, "hour": hour, "minute": minute, "on": int(on)}
         await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs})
+        self._programs_override = deepcopy(programs)
+        self._programs_override_at = get_datetime()
 
     async def send_preconditioning_programs_clear(self, button_name):
         """ Reset all four preconditioning program slots to the disabled placeholder.
@@ -287,6 +306,8 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                 "on": 0
             }
         await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs})
+        self._programs_override = deepcopy(programs)
+        self._programs_override_at = get_datetime()
 
     async def send_abrp_data(self):
         """ Send vehicle data to ABRP. """
