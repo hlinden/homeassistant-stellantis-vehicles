@@ -43,6 +43,15 @@ async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> No
                     )
                     entities.extend([StellantisPreconditioningProgramSwitch(coordinator, description, slot)])
 
+                description = SwitchEntityDescription(
+                    name = "clear_programs_automatically",
+                    key = "clear_programs_automatically",
+                    translation_key = "clear_programs_automatically",
+                    icon = "mdi:calendar-remove-outline",
+                    entity_category = EntityCategory.CONFIG
+                )
+                entities.extend([StellantisBaseSwitch(coordinator, description, True)])
+
             description = SwitchEntityDescription(
                 name = "abrp_sync",
                 key = "abrp_sync",

@@ -124,6 +124,14 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         return self.preconditioning_data.get("status") == "Enabled"
 
     @property
+    def preconditioning_programs_are_set(self):
+        """ True while at least one slot holds something other than the placeholder. """
+        for program in self.get_programs().values():
+            if program["on"] or any(program["day"]) or preconditioning_program_time(program) is not None:
+                return True
+        return False
+
+    @property
     def pending_action(self):
         """ Pending action. """
         if not self._commands_history:
@@ -264,13 +272,12 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
 
         Programs recur weekly, so a program written for a one off departure keeps
         firing on that weekday. This clears the lot in a single command.
+
+        Unlike a program write this is allowed while preconditioning is running.
+        The payload carries the same stop action the preconditioning stop button
+        sends, so a press during a session cancels the session and clears the
+        programs together, which is the point of pressing it then.
         """
-        if self.preconditioning_is_running:
-            _LOGGER.warning("Preconditioning is running on vehicle '%s', the programs were not cleared", self._vehicle["vin"])
-            raise ServiceValidationError(
-                translation_domain = DOMAIN,
-                translation_key = "preconditioning_program_running"
-            )
         programs = {}
         for slot in PRECONDITIONING_PROGRAM_SLOTS:
             programs[f"program{slot}"] = {
@@ -340,6 +347,16 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                             self._manage_charge_limit_sent = True
                 elif self._sensors.get("battery_charging") != "InProgress" and self._manage_charge_limit_sent:
                     self._manage_charge_limit_sent = False
+
+            if self._sensors.get("switch_clear_programs_automatically", False) and self.preconditioning_programs_are_set:
+                # _sensors still holds the previous cycle here, the entities update after this
+                run_ended = self._sensors.get("preconditioning") == "Enabled" and not self.preconditioning_is_running
+                started_moving = self._data.get("kinetic", {}).get("moving") and not self._sensors.get("moving")
+                if run_ended or started_moving:
+                    reason = "preconditioning stopped" if run_ended else "the vehicle started moving"
+                    _LOGGER.debug("Clearing the preconditioning programs of vehicle '%s', %s", self._vehicle["vin"], reason)
+                    button_name = self.get_translation("component.stellantis_vehicles.entity.button.preconditioning_programs_clear.name")
+                    await self.send_preconditioning_programs_clear(button_name)
 
             if "switch_abrp_sync" in self._sensors and self._sensors.get("switch_abrp_sync") and "text_abrp_token" in self._sensors and len(self._sensors.get("text_abrp_token")) == 36:
                 await self.send_abrp_data()
@@ -820,9 +837,10 @@ class StellantisBaseNumber(StellantisRestoreEntity, NumberEntity):
 
 
 class StellantisBaseSwitch(StellantisRestoreEntity, SwitchEntity):
-    def __init__(self, coordinator, description) -> None:
+    def __init__(self, coordinator, description, default_value = False) -> None:
         super().__init__(coordinator, description)
         self._sensor_key = f"switch_{self._key}"
+        self._default_value = bool(default_value)
 
     @property
     def is_on(self):
@@ -834,7 +852,8 @@ class StellantisBaseSwitch(StellantisRestoreEntity, SwitchEntity):
             return value
         if self._sensor_key in self._coordinator._sensors:
             return self._coordinator._sensors.get(self._sensor_key)
-        return False
+        self._coordinator._sensors[self._sensor_key] = self._default_value
+        return self._default_value
 
     async def async_turn_on(self, **kwargs):
         """ Turn on. """

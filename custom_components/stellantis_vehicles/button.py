@@ -167,10 +167,6 @@ class StellantisPreconditioningButton(StellantisBaseActionButton):
         await self._coordinator.send_preconditioning_command(self.name, self._action)
 
 class StellantisPreconditioningProgramsClearButton(StellantisBaseButton):
-    @property
-    def available(self):
-        return super().available and not self._coordinator.preconditioning_is_running
-
     async def async_press(self):
         await self._coordinator.send_preconditioning_programs_clear(self.name)
         await self._coordinator.async_refresh()

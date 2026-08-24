@@ -340,6 +340,9 @@
       "battery_values_correction": {
         "name": "Battery values correction"
       },
+      "clear_programs_automatically": {
+        "name": "Clear preconditioning programs automatically"
+      },
       "program1_enabled": {
         "name": "Preconditioning program 1"
       },
