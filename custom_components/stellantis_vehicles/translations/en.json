@@ -286,6 +286,9 @@
       }
     },
     "button": {
+      "preconditioning_programs_clear": {
+        "name": "Clear preconditioning programs"
+      },
       "wakeup": {
         "name": "WakeUp"
       },

@@ -100,6 +100,14 @@ async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> No
             )
             entities.extend([StellantisChargingStartStopButton(coordinator, description, "delayed")])
 
+            description = ButtonEntityDescription(
+                name = "preconditioning_programs_clear",
+                key = "preconditioning_programs_clear",
+                translation_key = "preconditioning_programs_clear",
+                icon = "mdi:calendar-remove"
+            )
+            entities.extend([StellantisPreconditioningProgramsClearButton(coordinator, description)])
+
     async_add_entities(entities)
 
 
@@ -157,3 +165,12 @@ class StellantisPreconditioningButton(StellantisBaseActionButton):
 
     async def async_press(self):
         await self._coordinator.send_preconditioning_command(self.name, self._action)
+
+class StellantisPreconditioningProgramsClearButton(StellantisBaseButton):
+    @property
+    def available(self):
+        return super().available and not self._coordinator.preconditioning_is_running
+
+    async def async_press(self):
+        await self._coordinator.send_preconditioning_programs_clear(self.name)
+        await self._coordinator.async_refresh()

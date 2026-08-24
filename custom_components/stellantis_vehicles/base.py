@@ -28,7 +28,10 @@ from .const import (
     UPDATE_INTERVAL,
     KWH_CORRECTION,
     PRECONDITIONING_SERVICE,
-    PRECONDITIONING_PROGRAM_ASAP
+    PRECONDITIONING_PROGRAM_ASAP,
+    PRECONDITIONING_PROGRAM_SLOTS,
+    PRECONDITIONING_PROGRAM_DISABLED_HOUR,
+    PRECONDITIONING_PROGRAM_DISABLED_MINUTE
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -254,6 +257,28 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
             )
         programs = self.get_programs()
         programs[f"program{slot}"] = {"day": day, "hour": hour, "minute": minute, "on": int(on)}
+        await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs})
+
+    async def send_preconditioning_programs_clear(self, button_name):
+        """ Reset all four preconditioning program slots to the disabled placeholder.
+
+        Programs recur weekly, so a program written for a one off departure keeps
+        firing on that weekday. This clears the lot in a single command.
+        """
+        if self.preconditioning_is_running:
+            _LOGGER.warning("Preconditioning is running on vehicle '%s', the programs were not cleared", self._vehicle["vin"])
+            raise ServiceValidationError(
+                translation_domain = DOMAIN,
+                translation_key = "preconditioning_program_running"
+            )
+        programs = {}
+        for slot in PRECONDITIONING_PROGRAM_SLOTS:
+            programs[f"program{slot}"] = {
+                "day": [0, 0, 0, 0, 0, 0, 0],
+                "hour": PRECONDITIONING_PROGRAM_DISABLED_HOUR,
+                "minute": PRECONDITIONING_PROGRAM_DISABLED_MINUTE,
+                "on": 0
+            }
         await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs})
 
     async def send_abrp_data(self):
