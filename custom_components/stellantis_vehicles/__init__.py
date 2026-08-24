@@ -12,6 +12,7 @@ from homeassistant.components.http import StaticPathConfig
 from .stellantis import StellantisVehicles
 from .exceptions import ComunicationError
 from .config_flow import StellantisVehiclesConfigFlow
+from .services import async_setup_services
 
 from .const import (
     DOMAIN,
@@ -50,6 +51,8 @@ async def async_setup_entry(hass: HomeAssistant, config: ConfigEntry):
     for vehicle in vehicles:
         coordinator = await stellantis.async_get_coordinator(vehicle)
         await coordinator.async_config_entry_first_refresh()
+
+    await async_setup_services(hass)
 
     url = f"/stellantis_vehicles/{INTEGRATION_VERSION}/stellantis-vehicle-card.js"
     if url not in hass.data["frontend_extra_module_url"].urls:
