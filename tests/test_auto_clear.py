@@ -70,8 +70,8 @@ sent = c.sent[0][2]["programs"]
 assert all(sent[f"program{n}"]["hour"] == 34 for n in range(1, 5))
 print("started moving       -> cleared all four")
 
-# already moving -> nothing
-c = C(data("Disabled", moving=True), {**on, "preconditioning": "Disabled", "moving": True})
+# already moving, and nothing spent -> nothing
+c = C(data("Disabled", programs=(chain[1],), moving=True), {**on, "preconditioning": "Disabled", "moving": True})
 assert run(c) == 0
 print("already moving       -> no command")
 
@@ -80,6 +80,17 @@ c = C(data("Disabled", programs=()), {**on, "preconditioning": "Disabled", "movi
 c._data["kinetic"]["moving"] = True
 assert run(c) == 0
 print("no programs set      -> no command")
+
+# a slot whose time passed without any run is still cleared
+c = C(data("Disabled", programs=(chain[0],)), {**on, "preconditioning": "Disabled", "moving": False})
+assert run(c) == 1
+assert c.sent[0][2]["programs"]["program1"]["hour"] == 34
+print("passed, never ran   -> cleared anyway")
+
+# but not while a session is running
+c = C(data("Enabled", programs=(chain[0],)), {**on, "preconditioning": "Enabled", "moving": False})
+assert run(c) == 0
+print("running             -> left alone")
 
 # switch off -> nothing
 c = C(data("Disabled", moving=True), {"switch_clear_programs_automatically": False, "preconditioning": "Enabled", "moving": False})

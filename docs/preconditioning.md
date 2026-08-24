@@ -50,11 +50,12 @@ actions:
 
 Fields left out of the call keep the current value. Slots that belong together, such as a pair covering an hour, should go in one call with the `programs` field.
 
-Two more entities handle the cleanup. **button.#####VIN#####_clear_preconditioning_programs** resets all four slots at once, and pressing it during a run also stops the run, since the command carries the same stop action as the preconditioning stop button. **switch.#####VIN#####_clear_preconditioning_programs_automatically**, on by default, clears slots that have been used. When a run ends it clears only the slots whose time has passed today, so a later slot covering the rest of a longer period survives. When the vehicle starts moving it clears all four, since the departure has happened.
+Two more entities handle the cleanup. **button.#####VIN#####_clear_preconditioning_programs** resets all four slots at once, and pressing it during a run also stops the run, since the command carries the same stop action as the preconditioning stop button. **switch.#####VIN#####_clear_preconditioning_programs_automatically**, on by default, clears slots whose time has passed today, whether or not the vehicle ran for them. A later slot is left alone, so a pair covering a longer period is not cut short. When the vehicle starts moving it clears all four, since the departure has happened.
 
 What was measured on one vehicle, an electric Opel, and may differ on yours:
 
 - The vehicle starts preconditioning about 30 minutes before the programmed time. A program written for a time nearer than that starts it immediately, and it runs until the programmed time rather than for a fixed duration.
 - The vehicle does not act on a second command sent moments after the first. Slots that belong together must go in one call.
 - After a session ends, the vehicle refuses a manual start for a while. A session of 32 minutes was followed by a refusal 7 minutes later, reported as `Preconditioning start: Error`. How long that lasts is unknown, and it applies to the preconditioning buttons as much as to programs.
+- Programs cannot be chained back to back, at least not 25 minutes apart. Two slots were written together, ready at 21:09 and 21:34. The first ran and ended at 21:09:55. The second did nothing at all: no session, no wallbox draw, no command. Either the vehicle declines a second session soon after the first, or it judged the cabin still warm enough to need no work. A thermometer in a vent would tell the two apart.
 - A written program takes a minute or two to appear in the entities, because they follow what the vehicle reports. Until it does, the integration answers with what it last wrote, so a second write does not undo the first.

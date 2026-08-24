@@ -389,12 +389,13 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                 # _sensors still holds the previous cycle here, the entities update after this
                 run_ended = self._sensors.get("preconditioning") == "Enabled" and not self.preconditioning_is_running
                 started_moving = self._data.get("kinetic", {}).get("moving") and not self._sensors.get("moving")
-                # A run that ends only spends the slot it ran for. Clearing the rest
-                # would delete a later slot that has not had its turn, which is how
-                # a pair of slots covering a longer period is built.
+                # A slot is spent once its time has passed, whether or not the vehicle
+                # ran for it: it has had its turn and would otherwise fire again on
+                # the same weekday next week. Clearing only the spent ones leaves a
+                # later slot alone, which is how a pair covering a longer period works.
                 slots = PRECONDITIONING_PROGRAM_SLOTS if started_moving else self.spent_program_slots
-                if (run_ended or started_moving) and slots:
-                    reason = "preconditioning stopped" if run_ended else "the vehicle started moving"
+                if slots and (run_ended or started_moving or not self.preconditioning_is_running):
+                    reason = "preconditioning stopped" if run_ended else ("the vehicle started moving" if started_moving else "their time has passed")
                     _LOGGER.debug("Clearing preconditioning program slots %s of vehicle '%s', %s", slots, self._vehicle["vin"], reason)
                     button_name = self.get_translation("component.stellantis_vehicles.entity.button.preconditioning_programs_clear.name")
                     await self.send_preconditioning_programs_clear(button_name, slots)
