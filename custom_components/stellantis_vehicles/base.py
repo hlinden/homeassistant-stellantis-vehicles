@@ -127,6 +127,20 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         return self.preconditioning_data.get("status") == "Enabled"
 
     @property
+    def spent_program_slots(self):
+        """ Slots set for today whose time has already passed. """
+        now = get_datetime()
+        result = []
+        for slot in PRECONDITIONING_PROGRAM_SLOTS:
+            program = self.get_programs()[f"program{slot}"]
+            program_time = preconditioning_program_time(program)
+            if not program["on"] or program_time is None or not program["day"][now.weekday()]:
+                continue
+            if (program_time.hour, program_time.minute) <= (now.hour, now.minute):
+                result.append(slot)
+        return result
+
+    @property
     def preconditioning_programs_are_set(self):
         """ True while at least one slot holds something other than the placeholder. """
         for program in self.get_programs().values():
@@ -286,19 +300,21 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._programs_override = deepcopy(programs)
         self._programs_override_at = get_datetime()
 
-    async def send_preconditioning_programs_clear(self, button_name):
-        """ Reset all four preconditioning program slots to the disabled placeholder.
+    async def send_preconditioning_programs_clear(self, button_name, slots = None):
+        """ Reset preconditioning program slots to the disabled placeholder.
 
         Programs recur weekly, so a program written for a one off departure keeps
-        firing on that weekday. This clears the lot in a single command.
+        firing on that weekday. Without a slot list this clears all four.
 
         Unlike a program write this is allowed while preconditioning is running.
         The payload carries the same stop action the preconditioning stop button
         sends, so a press during a session cancels the session and clears the
         programs together, which is the point of pressing it then.
         """
-        programs = {}
-        for slot in PRECONDITIONING_PROGRAM_SLOTS:
+        if slots is None:
+            slots = PRECONDITIONING_PROGRAM_SLOTS
+        programs = self.get_programs()
+        for slot in slots:
             programs[f"program{slot}"] = {
                 "day": [0, 0, 0, 0, 0, 0, 0],
                 "hour": PRECONDITIONING_PROGRAM_DISABLED_HOUR,
@@ -373,11 +389,15 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                 # _sensors still holds the previous cycle here, the entities update after this
                 run_ended = self._sensors.get("preconditioning") == "Enabled" and not self.preconditioning_is_running
                 started_moving = self._data.get("kinetic", {}).get("moving") and not self._sensors.get("moving")
-                if run_ended or started_moving:
+                # A run that ends only spends the slot it ran for. Clearing the rest
+                # would delete a later slot that has not had its turn, which is how
+                # a pair of slots covering a longer period is built.
+                slots = PRECONDITIONING_PROGRAM_SLOTS if started_moving else self.spent_program_slots
+                if (run_ended or started_moving) and slots:
                     reason = "preconditioning stopped" if run_ended else "the vehicle started moving"
-                    _LOGGER.debug("Clearing the preconditioning programs of vehicle '%s', %s", self._vehicle["vin"], reason)
+                    _LOGGER.debug("Clearing preconditioning program slots %s of vehicle '%s', %s", slots, self._vehicle["vin"], reason)
                     button_name = self.get_translation("component.stellantis_vehicles.entity.button.preconditioning_programs_clear.name")
-                    await self.send_preconditioning_programs_clear(button_name)
+                    await self.send_preconditioning_programs_clear(button_name, slots)
 
             if "switch_abrp_sync" in self._sensors and self._sensors.get("switch_abrp_sync") and "text_abrp_token" in self._sensors and len(self._sensors.get("text_abrp_token")) == 36:
                 await self.send_abrp_data()

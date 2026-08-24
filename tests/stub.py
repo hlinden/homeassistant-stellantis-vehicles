@@ -45,8 +45,10 @@ import homeassistant.util as hu
 class _dt:
     @staticmethod
     def get_default_time_zone():
-        from datetime import timezone
-        return timezone.utc
+        # the system zone, not UTC: program times are local wall clock and the
+        # code compares them against get_datetime()
+        from datetime import datetime
+        return datetime.now().astimezone().tzinfo
 hu.dt = _dt
 
 import homeassistant.helpers.update_coordinator as uc

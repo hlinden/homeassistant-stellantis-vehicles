@@ -36,20 +36,39 @@ on = {"switch_clear_programs_automatically": True}
 def run(c):
     asyncio.run(c.after_async_update_data()); return len(c.sent)
 
-# session just ended -> clear
-c = C(data("Disabled"), {**on, "preconditioning": "Enabled"})
+# a run that ends clears only the slot it ran for, a later slot survives
+import datetime as _dt
+now = _dt.datetime.now()
+past = "PT%dH%dM" % (max(now.hour - 1, 0), now.minute)
+future = "PT%dH%dM" % (min(now.hour + 1, 23), now.minute)
+today = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][now.weekday()]
+chain = (
+    {"slot": 1, "enabled": True, "start": past, "occurence": {"day": [today]}},
+    {"slot": 2, "enabled": True, "start": future, "occurence": {"day": [today]}},
+)
+c = C(data("Disabled", programs=chain), {**on, "preconditioning": "Enabled"})
 assert run(c) == 1, "expected a clear when the run ended"
-print("run ended            -> cleared:", c.sent[0][2]["programs"]["program1"])
+sent = c.sent[0][2]["programs"]
+assert sent["program1"]["hour"] == 34, "the slot that ran should be cleared"
+assert sent["program2"]["hour"] != 34, "a later slot must survive, it is the rest of the chain"
+print("run ended            -> cleared slot 1, kept slot 2 at", sent["program2"]["hour"])
+
+# a run that ends with nothing spent sends no command
+c = C(data("Disabled", programs=(chain[1],)), {**on, "preconditioning": "Enabled"})
+assert run(c) == 0
+print("nothing spent yet    -> no command")
 
 # session still running -> nothing
 c = C(data("Enabled"), {**on, "preconditioning": "Enabled"})
 assert run(c) == 0
 print("session still running -> no command")
 
-# car starts moving -> clear
-c = C(data("Disabled", moving=True), {**on, "preconditioning": "Disabled", "moving": False})
+# driving off clears everything, spent or not
+c = C(data("Disabled", programs=chain, moving=True), {**on, "preconditioning": "Disabled", "moving": False})
 assert run(c) == 1
-print("started moving       -> cleared")
+sent = c.sent[0][2]["programs"]
+assert all(sent[f"program{n}"]["hour"] == 34 for n in range(1, 5))
+print("started moving       -> cleared all four")
 
 # already moving -> nothing
 c = C(data("Disabled", moving=True), {**on, "preconditioning": "Disabled", "moving": True})

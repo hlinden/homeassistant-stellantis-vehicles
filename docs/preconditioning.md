@@ -50,7 +50,7 @@ actions:
 
 Fields left out of the call keep the current value. Slots that belong together, such as a pair covering an hour, should go in one call with the `programs` field.
 
-Two more entities handle the cleanup. **button.#####VIN#####_clear_preconditioning_programs** resets all four slots at once, and pressing it during a run also stops the run, since the command carries the same stop action as the preconditioning stop button. **switch.#####VIN#####_clear_preconditioning_programs_automatically**, on by default, clears the slots when a run ends or when the vehicle starts moving. Programs recur weekly, so without that a program written for a single departure keeps firing on that weekday.
+Two more entities handle the cleanup. **button.#####VIN#####_clear_preconditioning_programs** resets all four slots at once, and pressing it during a run also stops the run, since the command carries the same stop action as the preconditioning stop button. **switch.#####VIN#####_clear_preconditioning_programs_automatically**, on by default, clears slots that have been used. When a run ends it clears only the slots whose time has passed today, so a later slot covering the rest of a longer period survives. When the vehicle starts moving it clears all four, since the departure has happened.
 
 What was measured on one vehicle, an electric Opel, and may differ on yours:
 
