@@ -25,7 +25,7 @@ class C(base.StellantisVehicleCoordinator):
         self._sensors = dict(sensors); self._dropped_programs = set(); self._programs_override = None; self._programs_override_at = None; self.sent = []
         self._manage_charge_limit_sent = False; self._last_trip = None
         self._update_interval_seconds = 60
-    async def send_command(self, n, s, m): self.sent.append((n, s, m))
+    async def send_command(self, n, s, m, retry=False): self.sent.append((n, s, m))
     async def async_refresh(self): pass
     async def get_vehicle_last_trip(self): pass
     def get_translation(self, path, default=None):

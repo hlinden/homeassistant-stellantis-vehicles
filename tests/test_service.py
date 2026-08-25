@@ -22,7 +22,7 @@ class FakeCoordinator(base.StellantisVehicleCoordinator):
         self._dropped_programs = set(); self._programs_override = None; self._programs_override_at = None
         self.sent = []
         self.refreshed = 0
-    async def send_command(self, name, service, message):
+    async def send_command(self, name, service, message, retry=False):
         self.sent.append((name, service, message))
     async def async_refresh(self):
         self.refreshed += 1

@@ -32,7 +32,8 @@ from .const import (
     PRECONDITIONING_PROGRAM_SLOTS,
     PRECONDITIONING_PROGRAM_DISABLED_HOUR,
     PRECONDITIONING_PROGRAM_DISABLED_MINUTE,
-    PRECONDITIONING_PROGRAMS_OVERRIDE_TTL
+    PRECONDITIONING_PROGRAMS_OVERRIDE_TTL,
+    COMMAND_RETRY_DELAY
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -164,6 +165,15 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
             self._commands_history[action_id]["updates"].append({"info": update, "date": get_datetime()})
             if update == "not_compatible":
                 self._disabled_commands.append(self._commands_history[action_id]["name"])
+            elif update == "300" and "retry" in self._commands_history[action_id]:
+                # The vehicle was asleep and the command went nowhere. The platform
+                # already tried to wake it, so send the same command once more rather
+                # than a wakeup of our own, which is rate limited and drains the
+                # service battery.
+                retry = self._commands_history[action_id].pop("retry")
+                name = self._commands_history[action_id]["name"]
+                _LOGGER.warning("Command '%s' to vehicle '%s' timed out, sending it once more in %ss", name, self._vehicle["vin"], COMMAND_RETRY_DELAY)
+                self._stellantis.do_async(self.send_command(name, retry["service"], retry["message"]), COMMAND_RETRY_DELAY, False)
         self.async_update_listeners()
 
     def update_command_history_rate_limit(self, name):
@@ -171,12 +181,20 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._commands_history.update({current_datetime.time(): {"name": name, "updates": [{"info": "rate_limit", "date": current_datetime}]}})
         self.async_update_listeners()
 
-    async def send_command(self, name, service, message):
-        """ Send a command to the vehicle. """
+    async def send_command(self, name, service, message, retry_on_timeout = False):
+        """ Send a command to the vehicle.
+
+        With retry_on_timeout the command is kept so it can be sent once more if
+        the vehicle was asleep. Only use it for commands that set state and can
+        therefore be sent twice without doing something twice.
+        """
         try:
             action_id = await self._stellantis.send_mqtt_message(service, message, self._vehicle)
             if action_id is not None:
-                self._commands_history.update({action_id: {"name": name, "updates": []}})
+                command = {"name": name, "updates": []}
+                if retry_on_timeout:
+                    command["retry"] = {"service": service, "message": deepcopy(message)}
+                self._commands_history.update({action_id: command})
                 self.async_update_listeners()
         except ConfigEntryAuthFailed as e:
             _LOGGER.warning("Authentication failed while sending command '%s' to vehicle '%s': %s", name, self._vehicle['vin'], str(e))
@@ -296,7 +314,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                     translation_key = "preconditioning_program_days_missing"
                 )
             programs[f"program{slot}"] = {"day": day, "hour": hour, "minute": minute, "on": int(on)}
-        await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs})
+        await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs}, True)
         self._programs_override = deepcopy(programs)
         self._programs_override_at = get_datetime()
 
@@ -321,7 +339,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                 "minute": PRECONDITIONING_PROGRAM_DISABLED_MINUTE,
                 "on": 0
             }
-        await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs})
+        await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs}, True)
         self._programs_override = deepcopy(programs)
         self._programs_override_at = get_datetime()
 

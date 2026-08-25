@@ -36,7 +36,7 @@ class FakeCoordinator(base.StellantisVehicleCoordinator):
         self._disabled_commands = []
         self.sent = []
         self.refreshed = 0
-    async def send_command(self, name, service, message):
+    async def send_command(self, name, service, message, retry=False):
         self.sent.append((name, service, message))
     async def async_refresh(self):
         self.refreshed += 1

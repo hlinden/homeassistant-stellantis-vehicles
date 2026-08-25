@@ -146,6 +146,10 @@ PRECONDITIONING_PROGRAM_ASAP = "deactivate"
 # that two writes in a row do not build their payloads from the same stale data.
 PRECONDITIONING_PROGRAMS_OVERRIDE_TTL = 300
 
+# A command sent to a sleeping vehicle can come back as a timeout, and is then
+# lost. Program writes are resent once after this many seconds.
+COMMAND_RETRY_DELAY = 30
+
 SERVICE_SET_PRECONDITIONING_PROGRAM = "set_preconditioning_program"
 
 VEHICLE_TYPE_ELECTRIC = "Electric"

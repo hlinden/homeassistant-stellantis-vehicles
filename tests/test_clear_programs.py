@@ -19,7 +19,7 @@ class FakeCoordinator(base.StellantisVehicleCoordinator):
         self._data = data; self._vehicle = {"vin":"VIN1","type":"Electric"}
         self._sensors = {}; self._dropped_programs = set(); self.sent = []
         self._programs_override = None; self._programs_override_at = None
-    async def send_command(self, name, service, message): self.sent.append((name, service, message))
+    async def send_command(self, name, service, message, retry=False): self.sent.append((name, service, message))
 
 data = {"preconditionning": {"airConditioning": {"status": "Disabled", "programs": [
     {"slot": 1, "enabled": True, "start": "PT18H30M", "occurence": {"day": ["Mon"]}},
