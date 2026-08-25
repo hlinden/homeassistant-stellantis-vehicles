@@ -397,8 +397,10 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                 if slots and (run_ended or started_moving or not self.preconditioning_is_running):
                     reason = "preconditioning stopped" if run_ended else ("the vehicle started moving" if started_moving else "their time has passed")
                     _LOGGER.debug("Clearing preconditioning program slots %s of vehicle '%s', %s", slots, self._vehicle["vin"], reason)
-                    button_name = self.get_translation("component.stellantis_vehicles.entity.button.preconditioning_programs_clear.name")
-                    await self.send_preconditioning_programs_clear(button_name, slots)
+                    # Not the button's name: the command history has to show whether a
+                    # clear came from a press or from here.
+                    name = self.get_translation("component.stellantis_vehicles.entity.switch.clear_programs_automatically.name", "clear_programs_automatically")
+                    await self.send_preconditioning_programs_clear(name, slots)
 
             if "switch_abrp_sync" in self._sensors and self._sensors.get("switch_abrp_sync") and "text_abrp_token" in self._sensors and len(self._sensors.get("text_abrp_token")) == 36:
                 await self.send_abrp_data()

@@ -94,9 +94,11 @@ merge that touches the command path. All but the last were confirmed on
 
 ## Known unknowns
 
-- whether `asap: "deactivate"`, which every program write carries, cancels a
-  session that is already running. Program writes are refused while a session
-  runs precisely because this is untested
 - how long the vehicle refuses a manual start after a session ends. Seven
   minutes was not enough once
+- whether the vehicle limits how many programs run between drives. Six ran, the
+  seventh did nothing, and after a short drive the next two ran
 - everything measured comes from one vehicle, an electric Opel
+
+Answered since: `asap: "deactivate"` does stop a running session, so the refusal
+on program writes during a session is doing real work.

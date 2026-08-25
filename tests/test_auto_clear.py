@@ -28,7 +28,8 @@ class C(base.StellantisVehicleCoordinator):
     async def send_command(self, n, s, m): self.sent.append((n, s, m))
     async def async_refresh(self): pass
     async def get_vehicle_last_trip(self): pass
-    def get_translation(self, path, default=None): return default or "Clear preconditioning programs"
+    def get_translation(self, path, default=None):
+        return "Clear preconditioning programs automatically" if "switch." in path else (default or "Clear preconditioning programs")
     @property
     def vehicle_type(self): return "Electric"
 
@@ -96,4 +97,9 @@ print("running             -> left alone")
 c = C(data("Disabled", moving=True), {"switch_clear_programs_automatically": False, "preconditioning": "Enabled", "moving": False})
 assert run(c) == 0
 print("switch off           -> no command")
+# the command history must show which path cleared
+c = C(data("Disabled", programs=(chain[0],)), {**on, "preconditioning": "Enabled"})
+run(c)
+assert c.sent[0][0] == "Clear preconditioning programs automatically", c.sent[0][0]
+print("labelled            ->", c.sent[0][0])
 print("ALL OK")
