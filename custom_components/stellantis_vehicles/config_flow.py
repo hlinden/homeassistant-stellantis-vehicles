@@ -11,7 +11,7 @@ from homeassistant.const import (
     CONF_EMAIL
 )
 
-from .utils import get_datetime
+from .utils import extract_oauth_code, get_datetime, log_call
 from .stellantis import StellantisOauth
 from .const import (
     DOMAIN,
@@ -27,6 +27,7 @@ from .const import (
     FIELD_PIN_CODE,
     FIELD_NOTIFICATIONS,
     FIELD_ANONYMIZE_LOGS,
+    FIELD_MQTT_LIVE_UPDATES,
     FIELD_RECONFIGURE,
     MQTT_REFRESH_TOKEN_TTL,
     OAUTH_CODE_URL,
@@ -59,9 +60,10 @@ def OAUTH_REMOTE_SCHEMA(default_oauth_code_url=None):
         vol.Optional(FIELD_OAUTH_CODE_URL, default=default_oauth_code_url or OAUTH_CODE_URL): str
     })
 
-OTP_CONFIGURE_SCHEMA = vol.Schema({
-    vol.Required(FIELD_REMOTE_COMMANDS, default=False): bool
-})
+def OTP_CONFIGURE_SCHEMA(default_remote_commands=False):
+    return vol.Schema({
+        vol.Required(FIELD_REMOTE_COMMANDS, default=default_remote_commands): bool
+    })
 
 OTP_SCHEMA = vol.Schema({
     vol.Required(FIELD_SMS_CODE): str,
@@ -71,14 +73,20 @@ OTP_SCHEMA = vol.Schema({
 def OPTIONS_SCHEMA(reconfig=None):
     defaults = {
         FIELD_NOTIFICATIONS: True,
-        FIELD_ANONYMIZE_LOGS: True
+        FIELD_ANONYMIZE_LOGS: True,
+        FIELD_MQTT_LIVE_UPDATES: True
     }
     if reconfig:
         defaults.update(reconfig)
-    return vol.Schema({
+    schema = {
         vol.Required(FIELD_NOTIFICATIONS, default=defaults[FIELD_NOTIFICATIONS]): bool,
         vol.Required(FIELD_ANONYMIZE_LOGS, default=defaults[FIELD_ANONYMIZE_LOGS]): bool
-    })
+    }
+    # MQTT events only arrive with remote commands; entries without the key
+    # have them enabled (see StellantisVehicles.remote_commands).
+    if defaults.get(FIELD_REMOTE_COMMANDS) is not False:
+        schema[vol.Required(FIELD_MQTT_LIVE_UPDATES, default=defaults[FIELD_MQTT_LIVE_UPDATES])] = bool
+    return vol.Schema(schema)
 
 RECONFIGURE_SCHEMA = vol.Schema({
     vol.Required(FIELD_RECONFIGURE): selector({ "select": { "options": ['options', 'oauth', FIELD_REMOTE_COMMANDS], "translation_key": FIELD_RECONFIGURE } })
@@ -173,7 +181,7 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
             oauth_devtools = f"\n\n>***://oauth2redirect...?code=`{oauth_label}`&scope=openid..."
             return self.async_show_form(step_id="oauth_manual", data_schema=OAUTH_MANUAL_SCHEMA, description_placeholders={"oauth_link": oauth_link, "oauth_label": oauth_label, "oauth_devtools": oauth_devtools}, errors=errors)
 
-        self.stellantis.save_config({"oauth_code": user_input[FIELD_OAUTH_CODE]})
+        self.stellantis.save_config({"oauth_code": extract_oauth_code(user_input[FIELD_OAUTH_CODE])})
         return await self.async_step_get_access_token()
 
 
@@ -196,7 +204,12 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
             }}
             self.data.update(oauth)
             self.stellantis.save_config(oauth)
-            return self.async_show_form(step_id="get_access_token", data_schema=OTP_CONFIGURE_SCHEMA)
+            # Default to the account's current setting (e.g. on reauth/reconfigure)
+            # instead of always showing the box unchecked, which would otherwise
+            # silently turn remote commands off for an account that already has
+            # them enabled if the form is submitted as-is.
+            default_remote_commands = self.data.get(FIELD_REMOTE_COMMANDS, False)
+            return self.async_show_form(step_id="get_access_token", data_schema=OTP_CONFIGURE_SCHEMA(default_remote_commands))
 
         self.data.update({FIELD_REMOTE_COMMANDS: user_input[FIELD_REMOTE_COMMANDS]})
         self.stellantis.save_config({FIELD_REMOTE_COMMANDS: self.data[FIELD_REMOTE_COMMANDS]})
@@ -206,7 +219,12 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
         elif self.data[FIELD_REMOTE_COMMANDS]:
             return await self.async_step_otp()
         else:
-            self.data.update({"customer_id": "MN-" + str(uuid4()).replace("-", "")[:16]})
+            # Only fabricate a synthetic id on first setup - reauth already
+            # carried the account's existing one (real or synthetic) into
+            # self.data, and generating a new one here would needlessly orphan
+            # the vehicle image cache on every reauth.
+            if "customer_id" not in self.data:
+                self.data.update({"customer_id": "MN-" + str(uuid4()).replace("-", "")[:16]})
             return await self.async_step_options()
 
 
@@ -280,17 +298,19 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
     async def async_step_final(self, user_input=None):
+        unique_id = f"{str(self.data["customer_id"])}_{str(self.data["mobile_app"])}_{str(self.data["country_code"])}"
+
         if self.source == SOURCE_REAUTH:
             return self.async_update_reload_and_abort(self._get_reauth_entry(), data_updates=self.data, reload_even_if_entry_is_unchanged=False)
         if self.source == SOURCE_RECONFIGURE:
-            if self._get_reconfigure_entry().unique_id != str(self.data["customer_id"]):
-                await self.async_set_unique_id(str(self.data["customer_id"]))
+            if self._get_reconfigure_entry().unique_id != unique_id:
+                await self.async_set_unique_id(unique_id)
                 self._abort_if_unique_id_configured()
             if self._enable_remote_commands:
                 self.data.update({FIELD_REMOTE_COMMANDS: True})
-            return self.async_update_reload_and_abort(self._get_reconfigure_entry(), data_updates=self.data, reload_even_if_entry_is_unchanged=False, unique_id=str(self.data["customer_id"]))
+            return self.async_update_reload_and_abort(self._get_reconfigure_entry(), data_updates=self.data, reload_even_if_entry_is_unchanged=False, unique_id=unique_id)
 
-        await self.async_set_unique_id(str(self.data["customer_id"]))
+        await self.async_set_unique_id(unique_id)
         self._abort_if_unique_id_configured()
         return self.async_create_entry(title=self.data[FIELD_MOBILE_APP], data=self.data)
 
@@ -300,7 +320,15 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_show_form(step_id="reconfigure", data_schema=RECONFIGURE_SCHEMA)
 
         await self.init_translations()
-        self.stellantis = self.hass.data[DOMAIN][self._reconfigure_entry_id]
+        # ConfigEntry.runtime_data is only a type annotation, not a real
+        # attribute with a default: HA deletes it on unload and never sets it
+        # before the first successful setup, so a plain `.runtime_data` here
+        # can raise AttributeError instead of just being None.
+        self.stellantis = getattr(self._get_reconfigure_entry(), "runtime_data", None)
+        if self.stellantis is None:
+            # Setup failed and is being retried (e.g. a Stellantis backend
+            # outage), so there is nothing to reconfigure yet.
+            return self.async_abort(reason=self.get_error_message("not_loaded"))
         self.data = dict(self.stellantis._entry.data)
 
         if user_input[FIELD_RECONFIGURE] == FIELD_REMOTE_COMMANDS:
@@ -312,12 +340,24 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
             return await self.async_step_options()
 
 
+    @log_call
     async def async_step_reauth(self, entry_data):
-        _LOGGER.debug("---------- START async_step_reauth")
         self.data.update({FIELD_MOBILE_APP: entry_data[FIELD_MOBILE_APP], FIELD_COUNTRY_CODE: entry_data[FIELD_COUNTRY_CODE]})
         if FIELD_OAUTH_CODE_URL in entry_data:
             self.data.update({FIELD_OAUTH_CODE_URL: entry_data[FIELD_OAUTH_CODE_URL]})
-        _LOGGER.debug("---------- END async_step_reauth")
+        # Carried over so a plain reauth (just refreshing the OAuth token) can't
+        # silently disable remote commands or replace the account's real
+        # customer_id with a freshly generated one - both get merged back onto
+        # the entry in async_step_final via data_updates.
+        if FIELD_REMOTE_COMMANDS in entry_data:
+            self.data.update({FIELD_REMOTE_COMMANDS: entry_data[FIELD_REMOTE_COMMANDS]})
+        if "customer_id" in entry_data:
+            self.data.update({"customer_id": entry_data["customer_id"]})
+        # Reauth also passes through the options form, which would otherwise
+        # show (and on submit save) the defaults instead of the current choices.
+        for key in (FIELD_NOTIFICATIONS, FIELD_ANONYMIZE_LOGS, FIELD_MQTT_LIVE_UPDATES):
+            if key in entry_data:
+                self.data[key] = entry_data[key]
         return await self.async_step_reauth_confirm()
 
 

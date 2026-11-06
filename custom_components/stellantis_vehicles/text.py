@@ -8,7 +8,6 @@ from .base import ( StellantisBaseText, StellantisPreconditioningProgramEntity )
 from .utils import ( preconditioning_days_from_string, preconditioning_days_to_string )
 
 from .const import (
-    DOMAIN,
     VEHICLE_TYPE_ELECTRIC,
     VEHICLE_TYPE_HYBRID,
     PRECONDITIONING_PROGRAM_DAYS,
@@ -17,12 +16,15 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Serialize command calls so a bulk action can't flood the Stellantis cloud.
+PARALLEL_UPDATES = 1
+
 # Comma separated day names, in any order, or an empty value for no day
 DAY_NAMES_PATTERN = "|".join(PRECONDITIONING_PROGRAM_DAYS)
 DAYS_PATTERN = f"^$|^({DAY_NAMES_PATTERN})(,({DAY_NAMES_PATTERN}))*$"
 
 async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> None:
-    stellantis = hass.data[DOMAIN][entry.entry_id]
+    stellantis = entry.runtime_data
     entities = []
 
     vehicles = await stellantis.get_user_vehicles()

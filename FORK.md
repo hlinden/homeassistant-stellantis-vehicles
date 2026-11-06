@@ -40,14 +40,15 @@ Added, so they never conflict:
 - `custom_components/stellantis_vehicles/services.py`
 - `custom_components/stellantis_vehicles/services.yaml`
 - `docs/preconditioning.md`
-- `tests/run_all.sh`
-- `tests/stub.py`
-- `tests/test_auto_clear.py`
-- `tests/test_batch_write.py`
-- `tests/test_clear_programs.py`
-- `tests/test_program_entities.py`
-- `tests/test_programs_payload.py`
-- `tests/test_service.py`
+- `tests_fork/run_all.sh`
+- `tests_fork/stub.py`
+- `tests_fork/test_auto_clear.py`
+- `tests_fork/test_batch_write.py`
+- `tests_fork/test_clear_programs.py`
+- `tests_fork/test_command_retry.py`
+- `tests_fork/test_program_entities.py`
+- `tests_fork/test_programs_payload.py`
+- `tests_fork/test_service.py`
 - `tools/sync-upstream.sh`
 
 The heaviest conflict risk is `custom_components/stellantis_vehicles/base.py`,
@@ -75,9 +76,10 @@ After pushing, Redownload in HACS and restart Home Assistant.
 
 ## Checking it still works
 
-`./tests/run_all.sh` runs six offline suites covering the payload, the entities,
-the service, the clear button, the automatic clearing and the batch write. They
-need no Home Assistant install: `tests/stub.py` fabricates the modules the code
+`./tests_fork/run_all.sh` runs seven offline suites covering the payload, the entities,
+the service, the clear button, the automatic clearing, the batch write and the
+resend after a timeout. They
+need no Home Assistant install: `tests_fork/stub.py` fabricates the modules the code
 imports. Run them after every merge.
 
 They do not talk to a car. These need a vehicle and are worth repeating after a
@@ -91,6 +93,25 @@ merge that touches the command path. All but the last were confirmed on
    a second apart do not, which is why the batch exists
 5. the clear button empties all four, confirmed
 6. driving off clears the slots by itself, not yet seen
+
+The fork's suites live in `tests_fork/`, not `tests/`: upstream's CI runs `pytest`
+over `tests/`, and `stub.py` replaces the `homeassistant` modules for the whole
+process, which breaks upstream's real Home Assistant tests. Run those with
+`pip install -r requirements_test.txt && pytest`.
+
+## Things to recheck after a merge
+
+Points where the fork leans on upstream internals, each broken once by an
+upstream refactor that git merged without a conflict:
+
+- `services.py` finds a vehicle through `config_entry.runtime_data`
+  (formerly `hass.data[DOMAIN]`). The service is registered in `async_setup`
+- the coordinator reads vehicle data from `self.data`, and during an update from
+  the `new_data` passed to `after_async_update_data`, since `self.data` still
+  holds the previous cycle there. The automatic clear must use `new_data`
+- `send_command` refuses a command while another one is pending. The automatic
+  clear catches that and tries again on the next update
+- `stellantis.do_async` takes `wait` as a keyword
 
 ## Known unknowns
 

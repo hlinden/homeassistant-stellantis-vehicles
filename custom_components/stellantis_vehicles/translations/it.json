@@ -21,7 +21,8 @@
         "description": "Questo [servizio remoto]({oauth_remote_link}) viene utilizzato per simulare un browser ed effettuare l'accesso sul sito web ufficiale",
         "data": {
           "email": "Email",
-          "password": "Password"
+          "password": "Password",
+          "oauth_code_url": "URL servizio remoto di login"
         }
       },
       "oauth_manual": {
@@ -45,7 +46,8 @@
       "options": {
         "data": {
           "notifications": "Attiva le notifiche persistenti",
-          "anonymize_logs": "Nascondi i dati personali sui log"
+          "anonymize_logs": "Nascondi i dati personali sui log",
+          "mqtt_live_updates": "Aggiorna lo stato del veicolo in tempo reale tramite MQTT"
         }
       },
       "reauth_confirm": {
@@ -106,6 +108,12 @@
       "autonomy": {
         "name": "Autonomia"
       },
+      "mileage_before_maintenance": {
+        "name": "Chilometri al prossimo tagliando"
+      },
+      "days_before_maintenance": {
+        "name": "Giorni al prossimo tagliando"
+      },
       "battery": {
         "name": "Batteria"
       },
@@ -141,14 +149,34 @@
           "rate_limit": "Limite raggiunto (6 ogni 20 minuti)",
           "not_compatible": "Non compatibile",
           "failed": "Fallito",
-          "900": "Accettato",
-          "901": "Risveglio del veicolo",
+          "doors_state_unlocked": "Tutte le portiere sbloccate",
+          "doors_state_locked": "Tutte le portiere bloccate",
+          "doors_discarded_door_open": "Annullato - una portiera è aperta",
+          "doors_request_refused": "Rifiutato - portiera aperta o chiave all'interno",
+          "doors_unknown_reason": "Rifiutato - motivo sconosciuto",
+          "doors_cid_inside": "Rifiutato - chiave all'interno del veicolo",
+          "warning_discarded_sev_not_stop": "Annullato - motore in funzione",
+          "warning_wait_before_resend": "Già eseguito - attendere prima di rinviare",
+          "precond_discarded_sev_not_stop": "Annullato - motore in funzione",
+          "precond_discarded_already_ongoing": "Annullato - già in corso",
+          "precond_discarded_communication_problem": "Annullato - problema di comunicazione",
+          "precond_stop_discarded_sev_not_stop": "Stop annullato - motore in funzione",
+          "precond_stop_discarded_not_ongoing": "Stop annullato - non in corso",
+          "charging_discarded_standby": "Annullato - sistema di ricarica in standby",
+          "charging_discarded_already_ongoing": "Annullato - ricarica già in corso",
+          "charging_discarded_communication_problem": "Annullato - problema di comunicazione con il sistema di ricarica",
+          "charging_discarded_sev_not_stop": "Annullato - motore in funzione",
           "903": "Inoltrato",
-          "0": "Completato",
-          "300": "Timeout",
-          "500": "Errore",
+          "902": "Verifica dello stato",
+          "901": "Risveglio del veicolo",
+          "900": "Accettato",
+          "507": "Nessuna copertura GPS",
+          "506": "Operatore telefonico non supportato",
           "502": "Duplicato",
-          "422": "Privacy attiva"
+          "500": "Errore",
+          "422": "Privacy attiva",
+          "300": "Timeout",
+          "0": "Completato"
         }
       },
       "fuel": {
@@ -171,6 +199,9 @@
       },
       "air_temperature": {
         "name": "Temperatura aria"
+      },
+      "driving_behavior": {
+        "name": "Modalità di guida"
       },
       "last_trip": {
         "name": "Ultimo viaggio",
@@ -209,6 +240,9 @@
             "state": {
               "true": "Si"
             }
+          },
+          "mileage": {
+            "name": "Kilometraggio"
           },
           "initial_percentage": {
             "name": "Percentuale iniziale"
@@ -256,11 +290,35 @@
       "doors": {
         "name": "Portiere"
       },
+      "door_trunk": {
+        "name": "Bagagliaio"
+      },
+      "door_driver": {
+        "name": "Sportello conducente"
+      },
+      "door_passenger": {
+        "name": "Sportello passeggero"
+      },
+      "door_rear_left": {
+        "name": "Sportello posteriore sinistro"
+      },
+      "door_rear_right": {
+        "name": "Sportello posteriore destro"
+      },
+      "belt_driver": {
+        "name": "Cintura di sicurezza guidatore"
+      },
+      "belt_passenger": {
+        "name": "Cintura di sicurezza passeggero"
+      },
       "battery_plugged": {
         "name": "Batteria collegata"
       },
       "battery_charging": {
         "name": "Batteria in ricarica"
+      },
+      "battery_charging_limit": {
+        "name": "Ricarica limitata 80%"
       },
       "engine": {
         "name": "Motore"
@@ -276,6 +334,9 @@
       },
       "remote_commands": {
         "name": "Comandi remoti"
+      },
+      "command_pending": {
+        "name": "Comando in sospeso"
       },
       "daylight": {
         "name": "Luce del giorno"
@@ -303,6 +364,12 @@
       "charge_stop": {
         "name": "Stop ricarica"
       },
+      "charge_limit_on": {
+        "name": "Attiva ricarica limitata 80%"
+      },
+      "charge_limit_off": {
+        "name": "Disattiva ricarica limitata 80%"
+      },
       "preconditioning_start": {
         "name": "Start precondizionamento"
       },
@@ -312,7 +379,24 @@
     },
     "device_tracker": {
       "vehicle": {
-        "name": "Veicolo"
+        "name": "Veicolo",
+        "state_attributes": {
+          "altitude": {
+            "name": "Altitudine"
+          },
+          "fix_status": {
+            "name": "Stato del fix"
+          },
+          "signal_quality": {
+            "name": "Qualità del segnale"
+          },
+          "position_updated_at": {
+            "name": "Aggiornato il"
+          },
+          "entity_picture": {
+            "name": "Immagine entità"
+          }
+        }
       }
     },
     "number": {
@@ -345,6 +429,14 @@
       }
     }
   },
+  "exceptions": {
+    "command_already_pending": {
+      "message": "Impossibile inviare \"{name}\": \"{pending_name}\" è ancora in attesa di una risposta dal veicolo."
+    },
+    "command_not_sent": {
+      "message": "Impossibile inviare \"{name}\" al veicolo. Dettagli nel log."
+    }
+  },
   "common": {
     "access_token_error_title": "Access token error",
     "access_token_error_message": "Consulta la documentazione ufficiale nella sezione [OAuth2 Code]({oauth_token_doc_link})",
@@ -354,6 +446,12 @@
     "no_vehicles_found_message": "Nessun veicolo connesso disponibile in questo account",
     "command_error_title": "Comando",
     "command_error_message": "Il comando non è stato inviato correttamente"
+  },
+  "issues": {
+    "vehicle_removed": {
+      "title": "Il veicolo {vin} è stato rimosso dal tuo account",
+      "description": "Home Assistant non può più recuperare i dati del veicolo `{vin}` dalle API Stellantis, il veicolo non risulta collegato al tuo account Stellantis. Questo potrebbe indicare che il veicolo è stato venduto o ceduto a terzi. Rimuovi il veicolo dall'integrazione.\n\n**Importante:** Rimuovendo il veicolo verranno rimosse **tutte le sue entità** e **tutte le statistiche delle entità** registrate per il veicolo (es: energie, chilometri, storico batteria, ecc...). I dati non possono essere recuperati. Se vuoi mantenerli esportali o effettua un backup.\n\nPer rimuovere il veicolo:\n1. Vai su **Impostazioni > Dispositivi e servizi > Stellantis Vehicles**.\n2. Clicca sul menu nella riga del veicolo (tre puntini verticali) e clicca su **Rimuovi dispositivo**.\n3. Riavvia Home Assistant.\n\nQuesta notifica non apparirà dopo la rimozione del veicolo."
+    }
   },
   "selector": {
     "reconfigure": {

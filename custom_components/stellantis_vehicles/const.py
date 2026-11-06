@@ -1,7 +1,7 @@
 import os
 import json
 
-from homeassistant.const import ( UnitOfTemperature, UnitOfLength, PERCENTAGE, UnitOfEnergy, UnitOfSpeed, UnitOfVolume )
+from homeassistant.const import ( UnitOfTemperature, UnitOfLength, UnitOfTime, PERCENTAGE, UnitOfEnergy, UnitOfSpeed, UnitOfVolume, EntityCategory )
 from homeassistant.components.sensor.const import ( SensorDeviceClass, SensorStateClass )
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 
@@ -9,6 +9,8 @@ DOMAIN = "stellantis_vehicles"
 
 with open(os.path.dirname(os.path.abspath(__file__)) + "/manifest.json", "r") as f:
     manifest = json.load(f)
+    # A pre-release manifest version carries a "-beta.N" suffix (e.g. "2026.8.1-beta.3").
+    INTEGRATION_IS_BETA = "-beta" in manifest["version"]
     versions = manifest["version"].split("-beta")[0].split(".")
     minor = int(versions[1])
     if minor < 10:
@@ -32,6 +34,9 @@ OAUTH_CODE_URL = "https://homeassistant-stellantis-vehicles-worker.onrender.com"
 
 API_BASE_URL = "https://api.groupe-psa.com"
 GET_USER_INFO_URL = API_BASE_URL + "/applications/cvs/v4/mauv/car-associations"
+# The remote services a vehicle's subscription covers, each with its "fds"
+# feature code and official name (what the vendor app's forFDS(vin) calls).
+GET_VEHICLE_RIGHTS_URL = API_BASE_URL + "/applications/cvs/v4/rights/vehicle/{#vin#}"
 GET_OTP_URL = API_BASE_URL + "/applications/cvs/v4/mobile/smsCode"
 GET_MQTT_TOKEN_URL = API_BASE_URL + "/connectedcar/v4/virtualkey/remoteaccess/token"
 CAR_API_BASE_URL = API_BASE_URL + "/connectedcar/v4/user"
@@ -46,6 +51,56 @@ MQTT_RESP_TOPIC = "psa/RemoteServices/to/cid/"
 MQTT_EVENT_TOPIC = "psa/RemoteServices/events/MPHRTServices/"
 MQTT_REQ_TOPIC = "psa/RemoteServices/from/cid/"
 MQTT_QOS = 0
+MQTT_USERNAME = "IMA_OAUTH_ACCESS_TOKEN"
+
+# resp_data failure reasons per service and field, from the vendor app's
+# response enums; the first field present wins.
+MQTT_RESP_DATA_ERROR_CODES = {
+    "/Doors": {
+        "error": {
+            0: "warning_discarded_sev_not_stop",
+        },
+        "lock_resp_state": {
+            0: "doors_state_unlocked",
+            1: "doors_state_locked",
+            2: "doors_discarded_door_open",
+            3: "doors_request_refused",
+            4: "doors_unknown_reason",
+            5: "doors_cid_inside",
+        },
+    },
+    "/Horn": {
+        "error": {
+            0: "warning_discarded_sev_not_stop",
+            1: "warning_wait_before_resend",
+        },
+    },
+    "/Lights": {
+        "error": {
+            0: "warning_discarded_sev_not_stop",
+            2: "warning_wait_before_resend",
+        },
+    },
+    "/ThermalPrecond": {
+        "error": {
+            0: "precond_discarded_sev_not_stop",
+            1: "precond_discarded_already_ongoing",
+            2: "precond_discarded_communication_problem",
+            3: "precond_stop_discarded_sev_not_stop",
+            4: "precond_stop_discarded_not_ongoing",
+        },
+    },
+}
+
+# Shared by all /VehCharge* services; the app maps only 0-3.
+MQTT_CHARGING_RESP_DATA_ERROR_CODES = {
+    "error": {
+        0: "charging_discarded_standby",
+        1: "charging_discarded_already_ongoing",
+        2: "charging_discarded_communication_problem",
+        3: "charging_discarded_sev_not_stop",
+    },
+}
 
 KWH_CORRECTION = 1.343
 MS_TO_KMH_CONVERSION = 3.6
@@ -109,6 +164,7 @@ FIELD_SMS_CODE = "sms_code"
 FIELD_PIN_CODE = "pin_code"
 FIELD_NOTIFICATIONS = "notifications"
 FIELD_ANONYMIZE_LOGS = "anonymize_logs"
+FIELD_MQTT_LIVE_UPDATES = "mqtt_live_updates"
 FIELD_RECONFIGURE = "reconfigure"
 
 PLATFORMS = [
@@ -123,6 +179,46 @@ PLATFORMS = [
 ]
 
 UPDATE_INTERVAL = 60 # seconds
+
+# Seconds to wait before each retry of the supported features lookup.
+SUPPORTED_FEATURES_RETRY_DELAYS = (30, 120, 600)
+
+# Consecutive empty vehicle-status responses before the account vehicle list is
+# re-fetched to check whether the vehicle was unpaired.
+EMPTY_STATUS_LIMIT = 3
+
+# Maximum number of entries kept in a coordinator's command history. Without a
+# cap, every sent command would stay in memory (and be re-sorted on every
+# coordinator update) for as long as the coordinator lives.
+COMMAND_HISTORY_LIMIT = 50
+
+# process_code values that report a step of a command's lifecycle without
+# resolving it ("accepted", "vehicle asleep", "forwarded to vehicle"): a
+# command sent to the vehicle keeps blocking further remote commands (see
+# pending_action) through these. "901" is currently filtered out before it
+# ever reaches the command history (see the "Skip vehicle as sleep mqtt
+# message" handling in stellantis.py), so listing it here has no effect yet;
+# kept as a safeguard in case that changes.
+COMMAND_STATUS_STILL_IN_PROGRESS = ("900", "901", "903")
+
+# result_code values of a command that went through, so resp_data reports its
+# outcome rather than a failure reason.
+COMMAND_STATUS_SUCCESS = ("0", "1")
+
+# Seconds since a sent command was last updated before it is treated as
+# stale and no longer blocks further commands (see pending_action), even
+# though no final status ever arrived for it (e.g. the MQTT connection
+# dropped before the vehicle's actual response could arrive).
+PENDING_ACTION_TIMEOUT = 60
+
+# Backoff schedule (seconds) for the MQTT token refresh after a transient
+# Stellantis backend failure. Capped at the last step so a prolonged outage is
+# retried every ~15 min instead of once a minute.
+MQTT_TOKEN_RETRY_BACKOFF = (60, 120, 300, 600, 900)
+
+# Same schedule for the OAuth token refresh: retried on a capped backoff after a
+# transient failure instead of a flat 5-minute loop, and logged at WARNING.
+OAUTH_TOKEN_RETRY_BACKOFF = (60, 120, 300, 600, 900)
 
 PRECONDITIONING_SERVICE = "/ThermalPrecond"
 PRECONDITIONING_PROGRAM_SLOTS = [1, 2, 3, 4]
@@ -328,6 +424,27 @@ SENSORS_DEFAULT = {
         "value_map" : ["engines", 0, "extension", "thermic", "air", "temp"],
         "updated_at_map" : ["engines", 0, "createdAt"],
         "engine": [VEHICLE_TYPE_THERMIC, VEHICLE_TYPE_HYBRID]
+    },
+    "driving_behavior" : {
+        "icon": "mdi:steering",
+        "value_map" : ["drivingBehavior", "mode"],
+        "updated_at_map" : ["drivingBehavior", "createdAt"]
+    },
+    "mileage_before_maintenance" : {
+        "icon" : "mdi:car-wrench",
+        "unit_of_measurement" : UnitOfLength.KILOMETERS,
+        "device_class": SensorDeviceClass.DISTANCE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "value_map" : ["maintenance", "mileageBeforeMaintenance"],
+        "updated_at_map" : ["maintenance", "updatedAt"]
+    },
+    "days_before_maintenance" : {
+        "icon" : "mdi:calendar-clock",
+        "unit_of_measurement" : UnitOfTime.DAYS,
+        "device_class": SensorDeviceClass.DURATION,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "value_map" : ["maintenance", "daysBeforeMaintenance"],
+        "updated_at_map" : ["maintenance", "updatedAt"]
     }
 }
 
@@ -346,6 +463,55 @@ BINARY_SENSORS_DEFAULT = {
         "device_class" : BinarySensorDeviceClass.LOCK,
         "on_value": "Unlocked"
     },
+    "door_trunk" : {
+        "icon" : "mdi:car-back",
+        "value_map" : ["doorsState", "opening", {"identifier":"Trunk"}, "state"],
+        "updated_at_map" : ["doorsState", "createdAt"],
+        "device_class" : BinarySensorDeviceClass.DOOR,
+        "on_value": "Open"
+    },
+    "door_driver" : {
+        "icon" : "mdi:car-door",
+        "value_map" : ["doorsState", "opening", {"identifier":"Driver"}, "state"],
+        "updated_at_map" : ["doorsState", "createdAt"],
+        "device_class" : BinarySensorDeviceClass.DOOR,
+        "on_value": "Open"
+    },
+    "door_passenger" : {
+        "icon" : "mdi:car-door",
+        "value_map" : ["doorsState", "opening", {"identifier":"Passenger"}, "state"],
+        "updated_at_map" : ["doorsState", "createdAt"],
+        "device_class" : BinarySensorDeviceClass.DOOR,
+        "on_value": "Open"
+    },
+    "door_rear_left" : {
+        "icon" : "mdi:car-door",
+        "value_map" : ["doorsState", "opening", {"identifier":"RearLeft"}, "state"],
+        "updated_at_map" : ["doorsState", "createdAt"],
+        "device_class" : BinarySensorDeviceClass.DOOR,
+        "on_value": "Open"
+    },
+    "door_rear_right" : {
+        "icon" : "mdi:car-door",
+        "value_map" : ["doorsState", "opening", {"identifier":"RearRight"}, "state"],
+        "updated_at_map" : ["doorsState", "createdAt"],
+        "device_class" : BinarySensorDeviceClass.DOOR,
+        "on_value": "Open"
+    },
+    "belt_driver" : {
+        "icon" : "mdi:seatbelt",
+        "value_map" : ["safety", "beltStatus", {"id":"Driver"}, "belt"],
+        "updated_at_map" : ["safety", "createdAt"],
+        "device_class" : BinarySensorDeviceClass.SAFETY,
+        "on_value": "Omission"
+    },
+    "belt_passenger" : {
+        "icon" : "mdi:seatbelt",
+        "value_map" : ["safety", "beltStatus", {"id":"Passenger"}, "belt"],
+        "updated_at_map" : ["safety", "createdAt"],
+        "device_class" : BinarySensorDeviceClass.SAFETY,
+        "on_value": "Omission"
+    },
     "battery_plugged" : {
         "icon" : "mdi:power-plug-battery",
         "value_map" : ["energies", {"type":"Electric"}, "extension", "electric", "charging", "plugged"],
@@ -360,6 +526,13 @@ BINARY_SENSORS_DEFAULT = {
         "updated_at_map" : ["energy", {"type":"Electric"}, "updatedAt"],
         "device_class" : BinarySensorDeviceClass.BATTERY_CHARGING,
         "on_value": "InProgress",
+        "engine": [VEHICLE_TYPE_ELECTRIC, VEHICLE_TYPE_HYBRID]
+    },
+    "battery_charging_limit" : {
+        "icon" : "mdi:battery-lock",
+        "value_map" : ["energies", {"type":"Electric"}, "extension", "electric", "charging", "type"],
+        "updated_at_map" : ["energy", {"type":"Electric"}, "updatedAt"],
+        "on_value": "Partial",
         "engine": [VEHICLE_TYPE_ELECTRIC, VEHICLE_TYPE_HYBRID]
     },
     "engine" : {
@@ -384,11 +557,11 @@ BINARY_SENSORS_DEFAULT = {
         "on_value": "Active"
     },
     "privacy" : {
-        "icon" : "mdi:alarm-light",
+        "icon" : "mdi:eye-off",
         "value_map" : ["privacy", "state"],
         "updated_at_map" : ["privacy", "createdAt"],
-        "device_class" : BinarySensorDeviceClass.LOCK,
-        "on_value": "None"
+        "entity_category" : EntityCategory.DIAGNOSTIC,
+        "on_value": "Full"
     },
     "daylight" : {
         "icon" : "mdi:weather-sunny",

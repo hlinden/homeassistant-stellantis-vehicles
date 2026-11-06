@@ -1,10 +1,12 @@
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, UTC
 import json
 from copy import deepcopy
+from typing import Any
 
-from homeassistant.helpers.update_coordinator import ( CoordinatorEntity, DataUpdateCoordinator )
+from homeassistant.helpers.update_coordinator import ( CoordinatorEntity, DataUpdateCoordinator, UpdateFailed )
 from homeassistant.components.device_tracker import ( SourceType, TrackerEntity )
 from homeassistant.components.sensor import RestoreSensor
 from homeassistant.components.binary_sensor import BinarySensorEntity
@@ -16,16 +18,24 @@ from homeassistant.components.time import TimeEntity
 from homeassistant.core import callback, HomeAssistant
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.const import ( STATE_UNAVAILABLE, STATE_UNKNOWN, STATE_ON, STATE_OFF)
-from homeassistant.exceptions import ( ConfigEntryAuthFailed, ServiceValidationError )
+from homeassistant.exceptions import ( ConfigEntryAuthFailed, HomeAssistantError, ServiceValidationError )
+from homeassistant.helpers import issue_registry as ir
 
-from .utils import ( time_from_pt_string, get_datetime, date_from_pt_string, time_from_string, rate_limit, preconditioning_program_time )
+from .mqtt_event import event_content
+from .utils import ( time_from_pt_string, get_datetime, date_from_pt_string, time_from_string, parse_timestamp, rate_limit, log_call, parse_vehicle_rights, vehicle_removed_issue_id, SENSITIVE_DATA_FILTER, preconditioning_program_time )
+from .exceptions import CommunicationError, RateLimitException
 
 from .const import (
     DOMAIN,
+    SUPPORTED_FEATURES_RETRY_DELAYS,
     FIELD_MOBILE_APP,
     VEHICLE_TYPE_ELECTRIC,
     VEHICLE_TYPE_HYBRID,
     UPDATE_INTERVAL,
+    EMPTY_STATUS_LIMIT,
+    COMMAND_HISTORY_LIMIT,
+    COMMAND_STATUS_STILL_IN_PROGRESS,
+    PENDING_ACTION_TIMEOUT,
     KWH_CORRECTION,
     PRECONDITIONING_SERVICE,
     PRECONDITIONING_PROGRAM_ASAP,
@@ -37,6 +47,22 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+# Attached once, at import: the coordinator used to addFilter() a fresh
+# instance on every init (one per vehicle, on every setup and reload), and
+# nothing ever removed the old one, so filters stacked on this logger
+# (issue #414, PR #593).
+_LOGGER.addFilter(SENSITIVE_DATA_FILTER)
+
+# Event fields overlaid onto the REST data, grouped by the REST section they
+# update. Freshness is tracked per group (see _track_mqtt_changes), so every
+# field _overlay_mqtt_state writes must be covered here.
+_MQTT_OVERLAY_GROUPS = {
+    "charging": lambda event: ((event.get("charging") or {}).get("hmi_state_code"), (event.get("charging") or {}).get("plugged")),
+    "doors": lambda event: (event.get("doors") or {}).get("locking_state_code"),
+    "preconditioning": lambda event: (event.get("preconditioning") or {}).get("status_code"),
+    "door_opening": lambda event: (event.get("doors") or {}).get("open"),
+}
+
 
 class StellantisVehicleCoordinator(DataUpdateCoordinator):
     def __init__(self, hass:HomeAssistant, config, vehicle, stellantis, translations, config_entry) -> None:
@@ -47,45 +73,226 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._config = config
         self._vehicle = vehicle
         self._stellantis = stellantis
-        self._data = {}
         self._sensors = {}
+        # Last accepted MQTT vehicle event (see apply_mqtt_event) and the
+        # ordering/freshness state that goes with it.
+        self._mqtt_state = {}
+        self._mqtt_last_key = None
+        self._mqtt_changed_at:dict[str, datetime | None] = {}
         self._commands_history = {}
         self._disabled_commands = []
+        # action_id of the command currently blocking further remote
+        # commands, or None while none is blocking. Set as soon as that
+        # command is sent and cleared once it reaches a final status.
+        self._pending_action_id: str | None = None
         self._last_trip = None
 #        self._total_trip = None
         self._manage_charge_limit_sent = False
+        self._phase_offset = 0
+        self._privacy_full_logged = False
+        self._empty_status_count = 0
+        self._vehicle_removed = False
+        # Set once the maintenance endpoint has returned an empty result, so it
+        # is not polled again for the lifetime of this coordinator (issue #623:
+        # some vehicles 404 on every request and flooded the logs).
+        self._maintenance_unsupported = False
+        # Remote services the vehicle's subscription covers, keyed by "fds"
+        # code; None until async_lookup_supported_features has succeeded.
+        self._supported_features: dict[str, dict[str, Any]] | None = None
         self._dropped_programs = set()
         self._programs_override = None
         self._programs_override_at = None
 
-        if self._stellantis.logger_filter:
-            _LOGGER.addFilter(self._stellantis.logger_filter)
+    @property
+    def supported_features(self) -> dict[str, dict[str, Any]] | None:
+        """ Remote services the vehicle's subscription covers, keyed by "fds" code.
 
-    async def _async_update_data(self):
+        None means unknown (lookup pending or failed), {} means no services; a
+        caller gating on this must treat None as "allowed".
+        """
+        return self._supported_features
+
+    @log_call
+    async def async_lookup_supported_features(self) -> None:
+        """ Look up the remote services the vehicle's subscription covers.
+
+        Only shown in the diagnostics for now, nothing depends on it yet, so a
+        failure is logged and otherwise ignored. Communication errors are
+        retried with a growing delay; an auth failure is not, as it is not
+        raised inside setup or an update and so cannot start a reauth flow.
+        """
+        for delay in (*SUPPORTED_FEATURES_RETRY_DELAYS, None):
+            try:
+                response = await self._stellantis.get_vehicle_rights(self._vehicle)
+            except ConfigEntryAuthFailed as err:
+                _LOGGER.warning("Could not look up the vehicle's supported features: %s", err)
+                return
+            except (CommunicationError, RateLimitException) as err:
+                if delay is None:
+                    _LOGGER.warning("Could not look up the vehicle's supported features: %s", err)
+                    return
+                _LOGGER.debug("Supported features lookup failed, retrying in %s s: %s", delay, err)
+                await asyncio.sleep(delay)
+            else:
+                self._supported_features = parse_vehicle_rights(response)
+                _LOGGER.debug("Supported features: %s", self._supported_features)
+                return
+
+    @log_call
+    async def _async_update_data(self) -> dict[str, Any] | None:
         """ Update vehicle data from Stellantis. """
-        _LOGGER.debug("---------- START _async_update_data")
-        _LOGGER.debug(self._config)
+        _LOGGER.debug("Coordinator config: %s", self._config)
+        self._apply_refresh_interval_override()
+
+        new_data = await self._fetch_new_data()
+        if not new_data:
+            return await self._handle_empty_status()
+
+        self._empty_status_count = 0
+        self._clear_vehicle_removed()
+        self._log_privacy_mode(new_data.get("privacy", {}).get("state"))
+
+        if self._is_stale(new_data):
+            return self.data
+
+        if self._mqtt_state:
+            self._overlay_mqtt_state(new_data)
+
+        await self.after_async_update_data(new_data)
+        return new_data
+
+    def _apply_refresh_interval_override(self) -> None:
+        """ Consume the startup stagger and apply a user-configured refresh interval, if any. """
+        if self._phase_offset:
+            # The one-time startup stagger has been consumed, go back to the
+            # normal cadence (a number_refresh_interval override, if any, is
+            # re-applied just below).
+            self._phase_offset = 0
+            self.update_interval = timedelta(seconds=UPDATE_INTERVAL)
+
+        refresh_interval = self._sensors.get("number_refresh_interval")
+        if refresh_interval and refresh_interval > 0 and refresh_interval != self.update_interval.total_seconds():
+            self.update_interval = timedelta(seconds=refresh_interval)
+
+    async def _fetch_new_data(self) -> dict[str, Any] | None:
+        """ Fetch the vehicle status and maintenance info, translating API errors. """
         try:
             new_data = await self._stellantis.get_vehicle_status(self._vehicle)
-            if "updatedAt" in new_data and "updatedAt" in self._data:
-                try:
-                    current_dt = datetime.fromisoformat(self._data["updatedAt"])
-                    new_dt = datetime.fromisoformat(new_data["updatedAt"])
-                except ValueError:
-                    _LOGGER.debug("Invalid updatedAt values, proceeding with update without timestamp comparison")
-                else:
-                    if new_dt <= current_dt:
-                        _LOGGER.debug("API did not return updated vehicle data, skipping sensor update")
-                        _LOGGER.debug("---------- END _async_update_data")
-                        return
-            self._data = new_data
+            if new_data:
+                maintenance = {} if self._maintenance_unsupported else await self._stellantis.get_vehicle_maintenance(self._vehicle)
+                if maintenance:
+                    new_data["maintenance"] = {
+                        "mileageBeforeMaintenance": maintenance.get("mileageBeforeMaintenance"),
+                        "daysBeforeMaintenance": maintenance.get("daysBeforeMaintenance"),
+                        "updatedAt": maintenance.get("updatedAt")
+                    }
+                elif not self._maintenance_unsupported:
+                    _LOGGER.debug("Vehicle maintenance data not found - disabling further maintenance polling")
+                    self._maintenance_unsupported = True
+            return new_data
         except ConfigEntryAuthFailed:
-            _LOGGER.debug("---------- END _async_update_data")
             raise
-        except Exception:
-            pass
-        await self.after_async_update_data()
-        _LOGGER.debug("---------- END _async_update_data")
+        except Exception as err:
+            _LOGGER.debug("Error communicating with Stellantis API: %s", err)
+            raise UpdateFailed(
+                "Error communicating with Stellantis API, enable debug logging for details"
+            ) from err
+
+    async def _handle_empty_status(self) -> dict[str, Any] | None:
+        """ Handle an empty status response: tolerate a short gap, fail on a sustained outage. """
+        # Keep the last known data instead of blanking every entity on a
+        # single empty response (404 / empty body).
+        self._empty_status_count += 1
+        _LOGGER.debug(
+            "Empty vehicle status response (%s in a row), keeping last known data",
+            self._empty_status_count,
+        )
+
+        if self._empty_status_count < EMPTY_STATUS_LIMIT:
+            # Short gap: keep the last known data. ``self.data`` is still None
+            # if this is the very first refresh, so fall back to an empty
+            # dict - coordinator.data must never be None once entities exist,
+            # several of them subscript it directly.
+            return self.data or {}
+
+        if self._empty_status_count % EMPTY_STATUS_LIMIT == 0 and not self._vehicle_removed:
+            # Periodically check whether the vehicle was unpaired.
+            await self._reconcile_vehicle()
+
+        # Sustained outage: surface it so entities go unavailable.
+        raise UpdateFailed("Empty vehicle status response")
+
+    def _is_stale(self, new_data:dict[str, Any]) -> bool:
+        """ Whether new_data's updatedAt is not newer than the currently held data. """
+        if "updatedAt" not in new_data or not self.data or "updatedAt" not in self.data:
+            return False
+        current_dt = parse_timestamp(self.data["updatedAt"])
+        new_dt = parse_timestamp(new_data["updatedAt"])
+        if current_dt is None or new_dt is None:
+            _LOGGER.debug("Invalid updatedAt values, proceeding with update without timestamp comparison")
+            return False
+        if new_dt <= current_dt:
+            _LOGGER.debug("API did not return updated vehicle data, skipping sensor update")
+            return True
+        return False
+
+    def stagger_first_poll(self, offset_seconds):
+        """ Push this vehicle's next poll back once so several vehicles do not all
+        poll at the same instant after a restart. """
+        offset_seconds = int(offset_seconds)
+        if offset_seconds <= 0:
+            return
+        self._phase_offset = offset_seconds
+        self.update_interval = timedelta(seconds=UPDATE_INTERVAL + offset_seconds)
+
+    def _log_privacy_mode(self, state):
+        """ Log once when Stellantis private mode starts or stops pausing live data. """
+        active = state == "Full"
+        if active and not self._privacy_full_logged:
+            self._privacy_full_logged = True
+            _LOGGER.info("Private mode is enabled on vehicle %s, Stellantis has paused live data updates", self._vehicle["vin"])
+        elif not active and self._privacy_full_logged:
+            self._privacy_full_logged = False
+            _LOGGER.info("Private mode is disabled on vehicle %s, live data updates resumed", self._vehicle["vin"])
+
+    async def _reconcile_vehicle(self) -> None:
+        """ Re-fetch the account vehicle list to check whether this vehicle was unpaired.
+
+        Sets ``self._vehicle_removed`` and raises a repair issue only when the
+        vehicle is confirmed gone from the account.
+        """
+        vin = self._vehicle["vin"]
+        try:
+            live = await self._stellantis.get_user_vehicles(force=True)
+        except Exception as err:
+            _LOGGER.debug("Could not refresh the vehicle list for %s: %s", vin, err)
+            return
+        live_vins = {vehicle.get("vin") for vehicle in live}
+        if not live_vins or vin in live_vins:
+            # List unavailable or the vehicle is still there: keep polling.
+            return
+        self._vehicle_removed = True
+        _LOGGER.warning("Vehicle %s is no longer linked to this Stellantis account", vin)
+        ir.async_create_issue(
+            self._hass,
+            DOMAIN,
+            vehicle_removed_issue_id(vin),
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="vehicle_removed",
+            translation_placeholders={"vin": vin},
+        )
+
+    def _clear_vehicle_removed(self) -> None:
+        """ Vehicle answered again: drop the repair issue and log the recovery once.
+
+        The issue is persistent, so it can outlive the in-memory flag across a reload or restart.
+        """
+        ir.async_delete_issue(self._hass, DOMAIN, vehicle_removed_issue_id(self._vehicle["vin"]))
+        if self._vehicle_removed:
+            self._vehicle_removed = False
+            _LOGGER.info("Vehicle %s is reachable again", self._vehicle["vin"])
 
     def get_translation(self, path, default = None):
         """ Get translation from path. """
@@ -95,6 +302,142 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
     def vehicle_type(self):
         """ Vehicle type. """
         return self._vehicle["type"]
+
+    @property
+    def mqtt_state(self) -> dict[str, Any]:
+        """ Last accepted MQTT vehicle event (see parse_mqtt_event), or {} before the first one. """
+        return self._mqtt_state
+
+    @callback
+    def apply_mqtt_event(self, event:dict[str, Any]) -> None:
+        """ Apply a parsed MQTT vehicle event (see parse_mqtt_event).
+
+        Events for a given VIN are not guaranteed to arrive in order, so
+        older ones are discarded first. Only the fields in
+        _MQTT_OVERLAY_GROUPS reach the entities (see _overlay_mqtt_state);
+        battery level and range stay REST-only, as the MQTT values lag
+        behind REST and spike (checked against a month of both).
+        """
+        if not self._accept_mqtt_event_order(event):
+            return
+
+        if event_content(event) == event_content(self._mqtt_state):
+            # Nothing actually changed (a duplicate) - don't wake entities for it.
+            return
+
+        self._track_mqtt_changes(event)
+        self._mqtt_state = event
+        if self.data:
+            data = deepcopy(self.data)
+            self._overlay_mqtt_state(data)
+            # Not async_set_updated_data(): that would reset the REST poll timer.
+            self.data = data
+        self.async_update_listeners()
+
+    def _accept_mqtt_event_order(self, event:dict[str, Any]) -> bool:
+        """ Reject an MQTT event older than the last one accepted for this vehicle.
+
+        Ordering key is (timestamp, event_counter). event_counter resets to 1
+        on a new session, but the newer timestamp already orders that
+        correctly. Don't special-case counter 1: it is always the
+        session-start snapshot (reason 0), which often arrives after the
+        session's next events while still holding the older state. A missing
+        or unparsable timestamp or a missing counter can't be placed in the
+        sequence, so the event is accepted rather than silently dropped.
+        """
+        timestamp = parse_timestamp(event.get("timestamp"))
+        counter = event.get("event_counter")
+        if timestamp is None or counter is None:
+            return True
+
+        key = (timestamp, counter)
+        if self._mqtt_last_key is not None and key < self._mqtt_last_key:
+            _LOGGER.debug(
+                "Discarding out-of-order MQTT event for %s (key %s < last accepted %s)",
+                self._vehicle["vin"], key, self._mqtt_last_key,
+            )
+            return False
+
+        self._mqtt_last_key = key
+        return True
+
+    def _track_mqtt_changes(self, event:dict[str, Any]) -> None:
+        """ Record, per overlay group, when its values last changed via MQTT.
+
+        Events repeat the last known values with a fresh timestamp (in real
+        captures soc_batt stayed at a stale 58 for hours while REST already
+        reported 53), so the event timestamp says nothing about how fresh a
+        value is; only a change seen via MQTT does. The first event after
+        startup has nothing to compare with, so its values are left to REST
+        (None) until they change.
+        """
+        event_dt = parse_timestamp(event.get("timestamp"))
+        for group, values in _MQTT_OVERLAY_GROUPS.items():
+            if not self._mqtt_state:
+                self._mqtt_changed_at[group] = None
+            elif values(event) != values(self._mqtt_state):
+                self._mqtt_changed_at[group] = event_dt
+
+    def _overlay_mqtt_state(self, data:dict[str, Any]) -> None:
+        """ Write the fields of the last accepted MQTT event into REST-shaped ``data``, in place.
+
+        Entities keep reading ``coordinator.data`` via their value_map, so the
+        event is translated into the REST vocabulary. Each group is only
+        overwritten if it last changed via MQTT after that section's REST
+        timestamp, so a later REST poll wins again. Fields without a
+        confirmed mapping are left to REST.
+        """
+        event = self._mqtt_state
+
+        electric = next((energy for energy in data.get("energies") or [] if energy.get("type") == "Electric"), None)
+        if electric is not None and self._mqtt_is_newer("charging", electric.get("createdAt") or data.get("updatedAt")):
+            event_charging = event.get("charging") or {}
+            charging = electric.setdefault("extension", {}).setdefault("electric", {}).setdefault("charging", {})
+            # hmi_state codes matched against REST status at the same
+            # timestamp; REST reports plugged-but-idle as Disconnected too.
+            # 2 and 4 (seen around charge start) are unmapped.
+            charging_status = {0: "Disconnected", 1: "InProgress", 3: "Stopped"}.get(event_charging.get("hmi_state_code"))
+            if charging_status:
+                charging["status"] = charging_status
+            if event_charging.get("plugged") is not None:
+                charging["plugged"] = event_charging["plugged"]
+
+        doors_state = data.get("doorsState")
+        if doors_state is not None and self._mqtt_is_newer("doors", doors_state.get("createdAt") or data.get("updatedAt")):
+            locking_code = (event.get("doors") or {}).get("locking_state_code")
+            locked_states = doors_state.get("lockedStates") or []
+            # Only touch lockedStates when the lock state actually differs, so
+            # finer REST values (e.g. SuperLocked) survive. 0 and 7 are
+            # transient mid-(un)lock steps and are ignored.
+            if locking_code == 1 and "Unlocked" in locked_states:
+                doors_state["lockedStates"] = ["Locked"]
+            elif locking_code == 3 and "Unlocked" not in locked_states:
+                doors_state["lockedStates"] = ["Unlocked"]
+
+        if doors_state is not None and self._mqtt_is_newer("door_opening", doors_state.get("createdAt") or data.get("updatedAt")):
+            door_open = (event.get("doors") or {}).get("open") or {}
+            names = {"Driver": "driver", "Passenger": "passenger", "RearLeft": "rear_left", "RearRight": "rear_right", "Trunk": "trunk"}
+            for opening in doors_state.get("opening") or []:
+                name = names.get(opening.get("identifier"))
+                if name in door_open:
+                    opening["state"] = "Open" if door_open[name] else "Closed"
+
+        # REST sends this section as "preconditioning", "preconditionning" or
+        # both, depending on the vehicle; keep every copy consistent.
+        for key in ("preconditioning", "preconditionning"):
+            air_conditioning = (data.get(key) or {}).get("airConditioning")
+            if air_conditioning is not None and self._mqtt_is_newer("preconditioning", air_conditioning.get("createdAt") or data.get("updatedAt")):
+                status = {0: "Disabled", 1: "Enabled", 2: "Finished"}.get((event.get("preconditioning") or {}).get("status_code"))
+                if status:
+                    air_conditioning["status"] = status
+
+    def _mqtt_is_newer(self, group:str, rest_timestamp:Any) -> bool:
+        """ Whether the group's last MQTT change is newer than the REST timestamp (a missing one counts as older). """
+        changed_at = self._mqtt_changed_at.get(group)
+        if changed_at is None:
+            return False
+        rest_dt = parse_timestamp(rest_timestamp)
+        return rest_dt is None or changed_at > rest_dt
 
     @property
     def command_history(self):
@@ -118,22 +461,37 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
 
     @property
     def preconditioning_data(self):
-        """ Preconditioning data of the vehicle. The API spells the key with two n. """
-        data = self._data.get("preconditionning", self._data.get("preconditioning", {}))
-        return data.get("airConditioning", {})
+        """ Preconditioning data of the vehicle, from the last completed update. """
+        return self.get_preconditioning_data()
+
+    def get_preconditioning_data(self, data = None):
+        """ Preconditioning data of data, or of the last completed update.
+
+        The API spells the key with two n on some vehicles, one on others, or
+        sends both. data is passed during an update, when self.data still holds
+        the previous cycle.
+        """
+        if data is None:
+            data = self.data or {}
+        section = data.get("preconditionning") or data.get("preconditioning") or {}
+        return section.get("airConditioning") or {}
+
+    def get_preconditioning_is_running(self, data = None):
+        """ Preconditioning running state of data, or of the last completed update. """
+        return self.get_preconditioning_data(data).get("status") == "Enabled"
 
     @property
     def preconditioning_is_running(self):
         """ Preconditioning running state. """
-        return self.preconditioning_data.get("status") == "Enabled"
+        return self.get_preconditioning_is_running()
 
-    @property
-    def spent_program_slots(self):
+    def get_spent_program_slots(self, data = None):
         """ Slots set for today whose time has already passed. """
         now = get_datetime()
+        programs = self.get_programs(data)
         result = []
         for slot in PRECONDITIONING_PROGRAM_SLOTS:
-            program = self.get_programs()[f"program{slot}"]
+            program = programs[f"program{slot}"]
             program_time = preconditioning_program_time(program)
             if not program["on"] or program_time is None or not program["day"][now.weekday()]:
                 continue
@@ -142,29 +500,55 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         return result
 
     @property
-    def preconditioning_programs_are_set(self):
+    def spent_program_slots(self):
+        """ Slots set for today whose time has already passed. """
+        return self.get_spent_program_slots()
+
+    def get_preconditioning_programs_are_set(self, data = None):
         """ True while at least one slot holds something other than the placeholder. """
-        for program in self.get_programs().values():
+        for program in self.get_programs(data).values():
             if program["on"] or any(program["day"]) or preconditioning_program_time(program) is not None:
                 return True
         return False
 
     @property
-    def pending_action(self):
-        """ Pending action. """
-        if not self._commands_history:
-            return False
-        last_action_id = list(self._commands_history.keys())[-1]
-        return not self._commands_history[last_action_id]["updates"]
+    def preconditioning_programs_are_set(self):
+        """ True while at least one slot holds something other than the placeholder. """
+        return self.get_preconditioning_programs_are_set()
 
-    async def update_command_history(self, action_id, update = None):
+    @property
+    def pending_action(self) -> bool:
+        """ Pending action. """
+        if self._pending_action_id is None:
+            return False
+        pending_command = self._commands_history.get(self._pending_action_id)
+        if not pending_command:
+            return False
+        last_activity_at = pending_command["updates"][-1]["date"] if pending_command["updates"] else pending_command["sent_at"]
+        return (get_datetime() - last_activity_at).total_seconds() < PENDING_ACTION_TIMEOUT
+
+    def _prune_command_history(self):
+        """ Drop the oldest command-history entries beyond COMMAND_HISTORY_LIMIT.
+
+        Every sent command adds an entry that would otherwise never be
+        removed, growing this dict (and the linear sort in command_history)
+        for as long as the coordinator lives.
+        """
+        excess = len(self._commands_history) - COMMAND_HISTORY_LIMIT
+        for _ in range(max(0, excess)):
+            oldest_id = next(iter(self._commands_history))
+            del self._commands_history[oldest_id]
+
+    async def update_command_history(self, action_id: str, update: str | None = None) -> None:
         """ Update command history. """
         if action_id not in self._commands_history:
             return
         if update:
             self._commands_history[action_id]["updates"].append({"info": update, "date": get_datetime()})
             if update == "not_compatible":
-                self._disabled_commands.append(self._commands_history[action_id]["name"])
+                disabled_name = self._commands_history[action_id]["name"]
+                if disabled_name not in self._disabled_commands:
+                    self._disabled_commands.append(disabled_name)
             elif update == "300" and "retry" in self._commands_history[action_id]:
                 # The vehicle was asleep and the command went nowhere. The platform
                 # already tried to wake it, so send the same command once more rather
@@ -173,35 +557,66 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                 retry = self._commands_history[action_id].pop("retry")
                 name = self._commands_history[action_id]["name"]
                 _LOGGER.warning("Command '%s' to vehicle '%s' timed out, sending it once more in %ss", name, self._vehicle["vin"], COMMAND_RETRY_DELAY)
-                self._stellantis.do_async(self.send_command(name, retry["service"], retry["message"]), COMMAND_RETRY_DELAY, False)
+                self._stellantis.do_async(self._resend_command(name, retry["service"], retry["message"]), COMMAND_RETRY_DELAY, wait=False)
+            if update not in COMMAND_STATUS_STILL_IN_PROGRESS and self._pending_action_id == action_id:
+                self._pending_action_id = None
         self.async_update_listeners()
 
     def update_command_history_rate_limit(self, name):
         current_datetime = get_datetime()
         self._commands_history.update({current_datetime.time(): {"name": name, "updates": [{"info": "rate_limit", "date": current_datetime}]}})
+        self._prune_command_history()
         self.async_update_listeners()
 
-    async def send_command(self, name, service, message, retry_on_timeout = False):
+    async def _resend_command(self, name: str, service: str, message: dict[str, Any]) -> None:
+        """ Resend a timed out command. Runs in the background, so failures are logged, not raised. """
+        try:
+            await self.send_command(name, service, message)
+        except Exception as err:
+            _LOGGER.warning("Could not resend command '%s' to vehicle '%s': %s", name, self._vehicle["vin"], err)
+
+    async def send_command(self, name: str, service: str, message: dict[str, Any], retry_on_timeout: bool = False) -> None:
         """ Send a command to the vehicle.
 
         With retry_on_timeout the command is kept so it can be sent once more if
         the vehicle was asleep. Only use it for commands that set state and can
         therefore be sent twice without doing something twice.
         """
+        if self.pending_action:
+            pending_name = self._commands_history[self._pending_action_id]["name"]
+            raise ServiceValidationError(
+                translation_domain = DOMAIN,
+                translation_key = "command_already_pending",
+                translation_placeholders = {"name": name, "pending_name": pending_name}
+            )
         try:
             action_id = await self._stellantis.send_mqtt_message(service, message, self._vehicle)
-            if action_id is not None:
-                command = {"name": name, "updates": []}
-                if retry_on_timeout:
-                    command["retry"] = {"service": service, "message": deepcopy(message)}
-                self._commands_history.update({action_id: command})
-                self.async_update_listeners()
         except ConfigEntryAuthFailed as e:
             _LOGGER.warning("Authentication failed while sending command '%s' to vehicle '%s': %s", name, self._vehicle['vin'], str(e))
-            self._stellantis._entry.async_start_reauth(self._hass)
+            self.config_entry.async_start_reauth(self.hass)
+            action_id = None
         except Exception as e:
             _LOGGER.error("Failed to send command %s: %s", name, str(e))
             raise
+        if action_id is None:
+            _LOGGER.error("Failed to send command %s: it was not sent to the vehicle", name)
+            raise HomeAssistantError(
+                translation_domain = DOMAIN,
+                translation_key = "command_not_sent",
+                translation_placeholders = {"name": name}
+            )
+        # service/message are kept so a 400 "invalid token" response for
+        # this action_id can be retried with its own payload instead of
+        # whatever command was sent last account-wide (see _on_mqtt_message).
+        # sent_at is the fallback pending_action uses before any update
+        # has arrived yet (see pending_action).
+        command = {"name": name, "updates": [], "service": service, "message": message, "retried": False, "sent_at": get_datetime()}
+        if retry_on_timeout:
+            command["retry"] = {"service": service, "message": deepcopy(message)}
+        self._commands_history.update({action_id: command})
+        self._prune_command_history()
+        self._pending_action_id = action_id
+        self.async_update_listeners()
 
     @rate_limit(6, 1200) # 6 per 20 min
     async def send_wakeup_command(self, button_name):
@@ -229,47 +644,47 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                     action = "delayed"
         await self.send_command(button_name, "/VehCharge", {"program": {"hour": current_hour.hour, "minute": current_hour.minute}, "type": action})
 
-    def get_programs(self):
-        """ Get current preconditioning programs. """
+    async def send_charge_limit_command(self, button_name, action):
+        """ Send charge limit command to the vehicle. """
+        await self.send_command(button_name, "/VehCharge/limit", {"action": action})
+
+    def get_programs(self, data = None):
+        """ Get current preconditioning programs, of data or of the last completed update. """
         default_programs = {
            "program1": {"day": [0, 0, 0, 0, 0, 0, 0], "hour": 34, "minute": 7, "on": 0},
            "program2": {"day": [0, 0, 0, 0, 0, 0, 0], "hour": 34, "minute": 7, "on": 0},
            "program3": {"day": [0, 0, 0, 0, 0, 0, 0], "hour": 34, "minute": 7, "on": 0},
            "program4": {"day": [0, 0, 0, 0, 0, 0, 0], "hour": 34, "minute": 7, "on": 0}
         }
-        active_programs = None
-        if "programs" in self.preconditioning_data:
-            current_programs = self.preconditioning_data["programs"]
-            if current_programs:
-                for program in current_programs:
-                    if program:
-                        occurence = program.get("occurence")
-                        if occurence and occurence.get("day") and program.get("start"):
-                            date = time_from_pt_string(program["start"])
-                            config = {
-                                "day": [
-                                    int("Mon" in occurence["day"]),
-                                    int("Tue" in occurence["day"]),
-                                    int("Wed" in occurence["day"]),
-                                    int("Thu" in occurence["day"]),
-                                    int("Fri" in occurence["day"]),
-                                    int("Sat" in occurence["day"]),
-                                    int("Sun" in occurence["day"])
-                                ],
-                                "hour": date.hour,
-                                "minute": date.minute,
-                                "on": int(program["enabled"])
-                            }
-                            default_programs["program" + str(program["slot"])] = config
-                            self._dropped_programs.discard(program.get("slot"))
-                        elif program.get("slot") not in self._dropped_programs:
-                            # A program without a weekday recurrence or without a start
-                            # time cannot be represented here, so it is replaced by the
-                            # disabled placeholder. Every preconditioning command posts
-                            # the full set of programs back to the vehicle, which means
-                            # such a program is deleted the next time any of them is sent.
-                            self._dropped_programs.add(program.get("slot"))
-                            _LOGGER.warning("Preconditioning program %s of vehicle '%s' has no weekday recurrence or no start time and cannot be read, it will be deleted by the next preconditioning command: %s", program.get("slot"), self._vehicle["vin"], program)
+        for program in self.get_preconditioning_data(data).get("programs") or []:
+            if program:
+                occurence = program.get("occurence")
+                date = time_from_pt_string(program["start"]) if program.get("start") else None
+                if occurence and occurence.get("day") and date is not None:
+                    config = {
+                        "day": [
+                            int("Mon" in occurence["day"]),
+                            int("Tue" in occurence["day"]),
+                            int("Wed" in occurence["day"]),
+                            int("Thu" in occurence["day"]),
+                            int("Fri" in occurence["day"]),
+                            int("Sat" in occurence["day"]),
+                            int("Sun" in occurence["day"])
+                        ],
+                        "hour": date.hour,
+                        "minute": date.minute,
+                        "on": int(program["enabled"])
+                    }
+                    default_programs["program" + str(program["slot"])] = config
+                    self._dropped_programs.discard(program.get("slot"))
+                elif program.get("slot") not in self._dropped_programs:
+                    # A program without a weekday recurrence or without a readable
+                    # start time cannot be represented here, so it is replaced by the
+                    # disabled placeholder. Every preconditioning command posts
+                    # the full set of programs back to the vehicle, which means
+                    # such a program is deleted the next time any of them is sent.
+                    self._dropped_programs.add(program.get("slot"))
+                    _LOGGER.warning("Preconditioning program %s of vehicle '%s' has no weekday recurrence or no start time and cannot be read, it will be deleted by the next preconditioning command: %s", program.get("slot"), self._vehicle["vin"], program)
         if self._programs_override:
             expired = (get_datetime() - self._programs_override_at).total_seconds() > PRECONDITIONING_PROGRAMS_OVERRIDE_TTL
             if expired or default_programs == self._programs_override:
@@ -318,7 +733,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._programs_override = deepcopy(programs)
         self._programs_override_at = get_datetime()
 
-    async def send_preconditioning_programs_clear(self, button_name, slots = None):
+    async def send_preconditioning_programs_clear(self, button_name, slots = None, data = None):
         """ Reset preconditioning program slots to the disabled placeholder.
 
         Programs recur weekly, so a program written for a one off departure keeps
@@ -331,7 +746,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         """
         if slots is None:
             slots = PRECONDITIONING_PROGRAM_SLOTS
-        programs = self.get_programs()
+        programs = self.get_programs(data)
         for slot in slots:
             programs[f"program{slot}"] = {
                 "day": [0, 0, 0, 0, 0, 0, 0],
@@ -343,8 +758,14 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._programs_override = deepcopy(programs)
         self._programs_override_at = get_datetime()
 
-    async def send_abrp_data(self):
+    async def send_abrp_data(self, new_data: dict[str, Any]) -> None:
         """ Send vehicle data to ABRP. """
+        last_position = new_data.get("lastPosition")
+        if not isinstance(last_position, dict):
+            last_position = {}
+        coordinates = last_position.get("geometry", {}).get("coordinates") or []
+        heading = last_position.get("properties", {}).get("heading")
+
         tlm = {
             "utc": int(get_datetime().astimezone(UTC).timestamp()),
             "soc": None,
@@ -361,21 +782,23 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
             tlm["soc"] = self._sensors.get("battery")
         if self._sensors.get("speed") is not None:
             tlm["speed"] = self._sensors.get("speed")
-        if self._data.get("lastPosition") is not None:
-            tlm["lat"] = float(self._data["lastPosition"]["geometry"]["coordinates"][1])
-            tlm["lon"] = float(self._data["lastPosition"]["geometry"]["coordinates"][0])
+        if len(coordinates) >= 2:
+            tlm["lat"] = float(coordinates[1])
+            tlm["lon"] = float(coordinates[0])
         if self._sensors.get("battery_charging") is not None:
             tlm["is_charging"] = self._sensors.get("battery_charging") == "InProgress"
         if self._sensors.get("battery_charging_type") is not None:
             tlm["is_dcfc"] = tlm["is_charging"] and self._sensors.get("battery_charging_type") == "Quick"
+        if self._sensors.get("engine") is not None:
+            tlm["is_parked"] = self._sensors.get("engine") == "Stop"
         if self._sensors.get("battery_health_resistance") is not None:
             tlm["soh"] = float(self._sensors.get("battery_health_resistance"))
         if self._sensors.get("battery_health_capacity") is not None:
             tlm["soh"] = float(self._sensors.get("battery_health_capacity"))
-        if self._data.get("lastPosition", {}).get("properties", {}).get("heading") is not None:
-            tlm["heading"] = float(self._data.get("lastPosition").get("properties").get("heading"))
-        if len(self._data.get("lastPosition", {}).get("geometry", {}).get("coordinates", [])) == 3:
-            tlm["elevation"] = float(self._data.get("lastPosition").get("geometry").get("coordinates")[2])
+        if heading is not None:
+            tlm["heading"] = float(heading)
+        if len(coordinates) == 3:
+            tlm["elevation"] = float(coordinates[2])
         if self._sensors.get("temperature") is not None:
             tlm["ext_temp"] = self._sensors.get("temperature")
         if self._sensors.get("mileage") is not None:
@@ -387,52 +810,101 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         await self._stellantis.send_abrp_data(params)
 
 
-    async def after_async_update_data(self):
-        """ Apply changes and do actions after vehicle data update. """
+    async def after_async_update_data(self, new_data: dict[str, Any]) -> None:
+        """ Apply changes and do actions after vehicle data update.
+
+        ``new_data`` is passed explicitly (here and in the methods called from
+        here) because ``self.data`` is not updated by the framework until this
+        whole update cycle returns. ``self._sensors``, kept up to date
+        independently by the entities, is read the normal way via ``self``.
+        """
         if self.vehicle_type in [VEHICLE_TYPE_ELECTRIC, VEHICLE_TYPE_HYBRID]:
-            if "battery_charging" in self._sensors:
-                if self._sensors.get("battery_charging") == "InProgress" and not self._manage_charge_limit_sent:
-                    charge_limit_on = self._sensors.get("switch_battery_charging_limit", False)
-                    charge_limit = self._sensors.get("number_battery_charging_limit", None)
-                    if charge_limit_on and charge_limit and "battery" in self._sensors:
-                        current_battery = self._sensors.get("battery")
-                        if int(float(current_battery)) >= int(charge_limit):
-                            button_name = self.get_translation("component.stellantis_vehicles.entity.button.charge_stop.name")
-                            await self.send_charge_command(button_name, False, "delayed")
-                            self._manage_charge_limit_sent = True
-                elif self._sensors.get("battery_charging") != "InProgress" and self._manage_charge_limit_sent:
-                    self._manage_charge_limit_sent = False
+            await self._auto_stop_charge_at_limit()
+            await self._sync_abrp_if_enabled(new_data)
+            await self._auto_clear_preconditioning_programs(new_data)
+        await self._fetch_last_trip_on_engine_stop(new_data)
 
-            if self._sensors.get("switch_clear_programs_automatically", False) and self.preconditioning_programs_are_set:
-                # _sensors still holds the previous cycle here, the entities update after this
-                run_ended = self._sensors.get("preconditioning") == "Enabled" and not self.preconditioning_is_running
-                started_moving = self._data.get("kinetic", {}).get("moving") and not self._sensors.get("moving")
-                # A slot is spent once its time has passed, whether or not the vehicle
-                # ran for it: it has had its turn and would otherwise fire again on
-                # the same weekday next week. Clearing only the spent ones leaves a
-                # later slot alone, which is how a pair covering a longer period works.
-                slots = PRECONDITIONING_PROGRAM_SLOTS if started_moving else self.spent_program_slots
-                if slots and (run_ended or started_moving or not self.preconditioning_is_running):
-                    reason = "preconditioning stopped" if run_ended else ("the vehicle started moving" if started_moving else "their time has passed")
-                    _LOGGER.debug("Clearing preconditioning program slots %s of vehicle '%s', %s", slots, self._vehicle["vin"], reason)
-                    # Not the button's name: the command history has to show whether a
-                    # clear came from a press or from here.
-                    name = self.get_translation("component.stellantis_vehicles.entity.switch.clear_programs_automatically.name", "clear_programs_automatically")
-                    await self.send_preconditioning_programs_clear(name, slots)
+    async def _auto_clear_preconditioning_programs(self, new_data: dict[str, Any]) -> None:
+        """ Clear spent preconditioning program slots, when the switch for it is on. """
+        if not self._sensors.get("switch_clear_programs_automatically", False):
+            return
+        if not self.get_preconditioning_programs_are_set(new_data):
+            return
+        # _sensors still holds the previous cycle here, the entities update after this
+        is_running = self.get_preconditioning_is_running(new_data)
+        run_ended = self._sensors.get("preconditioning") == "Enabled" and not is_running
+        started_moving = (new_data.get("kinetic") or {}).get("moving") and not self._sensors.get("moving")
+        # A slot is spent once its time has passed, whether or not the vehicle
+        # ran for it: it has had its turn and would otherwise fire again on
+        # the same weekday next week. Clearing only the spent ones leaves a
+        # later slot alone, which is how a pair covering a longer period works.
+        slots = PRECONDITIONING_PROGRAM_SLOTS if started_moving else self.get_spent_program_slots(new_data)
+        if not slots or not (run_ended or started_moving or not is_running):
+            return
+        reason = "preconditioning stopped" if run_ended else ("the vehicle started moving" if started_moving else "their time has passed")
+        _LOGGER.debug("Clearing preconditioning program slots %s of vehicle '%s', %s", slots, self._vehicle["vin"], reason)
+        # Not the button's name: the command history has to show whether a
+        # clear came from a press or from here.
+        name = self.get_translation("component.stellantis_vehicles.entity.switch.clear_programs_automatically.name", "clear_programs_automatically")
+        try:
+            await self.send_preconditioning_programs_clear(name, slots, new_data)
+        except (HomeAssistantError, CommunicationError) as err:
+            # Raising here would fail the whole update and discard the fresh data.
+            # Nothing is lost: the slots are still spent on the next update.
+            _LOGGER.warning("Could not clear the preconditioning programs of vehicle %s, retrying on the next update: %s", self._vehicle["vin"], err)
 
-            if "switch_abrp_sync" in self._sensors and self._sensors.get("switch_abrp_sync") and "text_abrp_token" in self._sensors and len(self._sensors.get("text_abrp_token")) == 36:
-                await self.send_abrp_data()
+    async def _auto_stop_charge_at_limit(self) -> None:
+        """ Send a delayed charge-stop command once the configured limit is reached. """
+        if "battery_charging" not in self._sensors:
+            return
+        if self._sensors.get("battery_charging_limit") == "Partial":
+            return
+        if self._sensors.get("battery_charging") != "InProgress":
+            self._manage_charge_limit_sent = False
+            return
+        if self._manage_charge_limit_sent:
+            return
+        charge_limit_on = self._sensors.get("switch_battery_charging_limit", False)
+        charge_limit = self._sensors.get("number_battery_charging_limit")
+        battery = self._sensors.get("battery")
+        if not (charge_limit_on and charge_limit and battery is not None):
+            return
+        if int(float(battery)) < int(charge_limit):
+            return
+        # The stop command carries the charging start time (hour/minute); until
+        # the vehicle reports one this is a normal state, not an error.
+        if self._sensors.get("time_battery_charging_start") is None:
+            _LOGGER.debug("Cannot auto-stop charging for vehicle %s yet: no charging start time known", self._vehicle["vin"])
+            return
+        button_name = self.get_translation("component.stellantis_vehicles.entity.button.charge_stop.name")
+        try:
+            await self.send_charge_command(button_name, False, "delayed")
+        except (HomeAssistantError, CommunicationError) as err:
+            # Raising here would fail the whole update and discard the fresh data.
+            _LOGGER.warning("Could not stop charging vehicle %s at the configured limit, retrying on the next update: %s", self._vehicle["vin"], err)
+            return
+        self._manage_charge_limit_sent = True
 
+    async def _sync_abrp_if_enabled(self, new_data: dict[str, Any]) -> None:
+        """ Push the current status to ABRP if sync is enabled with a valid token. """
+        if not self._sensors.get("switch_abrp_sync"):
+            return
+        token = self._sensors.get("text_abrp_token")
+        if not token or len(token) != 36:
+            return
+        await self.send_abrp_data(new_data)
+
+    async def _fetch_last_trip_on_engine_stop(self, new_data: dict[str, Any]) -> None:
+        """ Fetch the last trip once the engine transitions from running to Stop. """
         current_engine_status = self._sensors.get("engine")
-        new_engine_status = self._data.get("ignition", {}).get("type")
-        if new_engine_status == "Stop" and current_engine_status not in (None, "Stop"):
-            _LOGGER.debug("Engine status changed from %s to %s, fetching last trip data", current_engine_status, new_engine_status)
-            await self.get_vehicle_last_trip()
-        else:
-            _LOGGER.debug("Engine status unchanged or not relevant for trip data fetch: %s vs %s", current_engine_status, new_engine_status)
-
-        if "number_refresh_interval" in self._sensors and self._sensors.get("number_refresh_interval") > 0 and self._sensors.get("number_refresh_interval") != self._update_interval_seconds:
-            self.update_interval = timedelta(seconds=self._sensors.get("number_refresh_interval"))
+        new_engine_status = new_data.get("ignition", {}).get("type")
+        if new_engine_status != "Stop":
+            return
+        if current_engine_status in (None, "Stop"):
+            _LOGGER.debug("No last-trip fetch needed (engine %s -> Stop)", current_engine_status)
+            return
+        _LOGGER.debug("Engine status changed from %s to %s, fetching last trip data", current_engine_status, new_engine_status)
+        await self.get_vehicle_last_trip()
 
     async def get_vehicle_last_trip(self):
         """ Get last trip from Stellantis. """
@@ -441,8 +913,8 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
             if "_embedded" in trips and "trips" in trips["_embedded"] and trips["_embedded"]["trips"]:
                 if not self._last_trip or self._last_trip["id"] != trips["_embedded"]["trips"][-1]["id"]:
                     self._last_trip = trips["_embedded"]["trips"][-1]
-        except Exception:
-            pass
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch last trip data: %s", e)
 
 #     def parse_trips_page_data(self, data):
 #         result = []
@@ -532,7 +1004,7 @@ class StellantisBaseEntity(CoordinatorEntity):
             },
             "name": self._vehicle["vin"],
             "model": self._coordinator.get_translation(f"component.stellantis_vehicles.entity.sensor.type.state.{self._vehicle["type"].lower()}", self._vehicle["type"]) + " - " + self._vehicle["vin"],
-            "manufacturer": self._config[FIELD_MOBILE_APP]
+            "manufacturer": self._vehicle.get("brand") or self._config[FIELD_MOBILE_APP]
         }
 
     def value_was_updated(self):
@@ -548,7 +1020,7 @@ class StellantisBaseEntity(CoordinatorEntity):
 
     def get_value_from_map(self, value_map):
         """ Get data value from map. """
-        vehicle_data = self._coordinator._data
+        vehicle_data = self._coordinator.data
         value = None
         for key in value_map:
             if value is None: # first key in the map
@@ -633,7 +1105,11 @@ class StellantisBaseEntity(CoordinatorEntity):
 
         if key == 'battery':
             value = int(value)
-            autonomy = self._coordinator._sensors.get("autonomy")
+            # Read the autonomy from the current payload rather than from the
+            # retained sensor cache: the cache keeps the previous value when the
+            # field is absent (sleeping car), so a stale 0 would zero a fresh
+            # battery level and freeze the sensor.
+            autonomy = self.get_value_from_map(["energies", {"type": "Electric"}, "autonomy"])
             if value > 90 and autonomy is not None and autonomy == 0:
                 # https://github.com/andreadegiovine/homeassistant-stellantis-vehicles/pull/476
                 value = 0
@@ -646,15 +1122,13 @@ class StellantisBaseEntity(CoordinatorEntity):
     @property
     def available_command(self):
         """ Base availability property for mqtt commands. """
-        mqtt_is_connected = self._stellantis and self._stellantis._mqtt and self._stellantis._mqtt.is_connected()
+        mqtt_is_connected = self._stellantis and self._stellantis._mqtt and self._stellantis._mqtt.is_connected() and self._stellantis._mqtt_connected
         command_is_enabled = self.name not in self._coordinator._disabled_commands
-        return mqtt_is_connected and command_is_enabled and not self._coordinator.pending_action
+        return mqtt_is_connected and command_is_enabled
 
     @callback
     def _handle_coordinator_update(self):
         """ Coordinator handler. """
-        if self._coordinator.data is False:
-            return
         self.coordinator_update()
         self.async_write_ha_state()
 
@@ -677,30 +1151,55 @@ class StellantisBaseDevice(StellantisBaseEntity, TrackerEntity):
         return False
 
     @property
+    def _last_position(self):
+        """ Last known position feature. """
+        last_position = self._coordinator.data.get("lastPosition")
+        return last_position if isinstance(last_position, dict) else {}
+
+    @property
+    def _coordinates(self):
+        """ GPS coordinates [lon, lat, alt] of the last known position. """
+        geometry = self._last_position.get("geometry") or {}
+        coordinates = geometry.get("coordinates")
+        return coordinates if isinstance(coordinates, list) else []
+
+    @property
+    def _position_properties(self):
+        """ Properties of the last known position. """
+        properties = self._last_position.get("properties")
+        return properties if isinstance(properties, dict) else {}
+
+    @property
     def latitude(self):
         """ Latitude. """
-        if "lastPosition" in self._coordinator._data:
-            return float(self._coordinator._data["lastPosition"]["geometry"]["coordinates"][1])
-        return None
+        return float(self._coordinates[1]) if len(self._coordinates) >= 2 else None
 
     @property
     def longitude(self):
         """ Longitude. """
-        if "lastPosition" in self._coordinator._data:
-            return float(self._coordinator._data["lastPosition"]["geometry"]["coordinates"][0])
-        return None
+        return float(self._coordinates[0]) if len(self._coordinates) >= 2 else None
 
     @property
     def location_accuracy(self):
         """ Location accuracy. """
-        if "lastPosition" in self._coordinator._data:
-            return 10
-        return None
+        return 10 if len(self._coordinates) >= 2 else None
 
     @property
     def source_type(self):
         """ Source type. """
         return SourceType.GPS
+
+    @property
+    def extra_state_attributes(self):
+        """ Extra state attributes. """
+        attributes = dict(self._attr_extra_state_attributes)
+        coordinates = self._coordinates
+        properties = self._position_properties
+        attributes["altitude"] = float(coordinates[2]) if len(coordinates) == 3 else None
+        attributes["fix_status"] = properties.get("fixStatus")
+        attributes["signal_quality"] = properties.get("signalQuality")
+        attributes["position_updated_at"] = properties.get("createdAt")
+        return attributes
 
     def coordinator_update(self):
         """ Coordinator update. """
@@ -889,13 +1388,13 @@ class StellantisBaseNumber(StellantisRestoreEntity, NumberEntity):
             return self._coordinator._sensors.get(self._sensor_key)
         return self._default_value
 
-    async def async_set_native_value(self, value: float):
+    async def async_set_native_value(self, value:float) -> None:
         """ Set native value. """
         self._attr_native_value = value
         self._coordinator._sensors[self._sensor_key] = float(value)
         vin = self._coordinator._vehicle['vin']
         self._stellantis.update_vehicle_stored_config(vin, self._sensor_key, float(value))
-        await self._coordinator.async_refresh()
+        await self._coordinator.async_request_refresh()
 
 
 class StellantisBaseSwitch(StellantisRestoreEntity, SwitchEntity):
@@ -917,21 +1416,21 @@ class StellantisBaseSwitch(StellantisRestoreEntity, SwitchEntity):
         self._coordinator._sensors[self._sensor_key] = self._default_value
         return self._default_value
 
-    async def async_turn_on(self, **kwargs):
+    async def async_turn_on(self, **kwargs:Any) -> None:
         """ Turn on. """
         self._attr_is_on = True
         self._coordinator._sensors[self._sensor_key] = True
         vin = self._coordinator._vehicle['vin']
         self._stellantis.update_vehicle_stored_config(vin, self._sensor_key, True)
-        await self._coordinator.async_refresh()
+        await self._coordinator.async_request_refresh()
 
-    async def async_turn_off(self, **kwargs):
+    async def async_turn_off(self, **kwargs:Any) -> None:
         """ Turn off. """
         self._attr_is_on = False
         self._coordinator._sensors[self._sensor_key] = False
         vin = self._coordinator._vehicle['vin']
         self._stellantis.update_vehicle_stored_config(vin, self._sensor_key, False)
-        await self._coordinator.async_refresh()
+        await self._coordinator.async_request_refresh()
 
 
 class StellantisBaseText(StellantisRestoreEntity, TextEntity):
@@ -951,13 +1450,13 @@ class StellantisBaseText(StellantisRestoreEntity, TextEntity):
             return self._coordinator._sensors.get(self._sensor_key)
         return ""
 
-    async def async_set_value(self, value: str):
+    async def async_set_value(self, value:str) -> None:
         """ Set value. """
         self._attr_native_value = value
         self._coordinator._sensors[self._sensor_key] = str(value)
         vin = self._coordinator._vehicle['vin']
         self._stellantis.update_vehicle_stored_config(vin, self._sensor_key, str(value))
-        await self._coordinator.async_refresh()
+        await self._coordinator.async_request_refresh()
 
 
 class StellantisBaseTime(StellantisRestoreEntity, TimeEntity):

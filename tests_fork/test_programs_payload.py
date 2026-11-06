@@ -32,7 +32,7 @@ assert str(utils.preconditioning_program_time({"hour":8,"minute":5})) == "08:05:
 # --- coordinator
 class FakeCoordinator(base.StellantisVehicleCoordinator):
     def __init__(self, data):
-        self._data = data
+        self.data = data
         self._vehicle = {"vin": "VF1TESTVIN0000001", "type": "Electric"}
         self._sensors = {}
         self._dropped_programs = set(); self._programs_override = None; self._programs_override_at = None

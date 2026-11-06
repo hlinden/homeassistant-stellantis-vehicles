@@ -21,7 +21,7 @@ def data(status="Disabled", programs=(PROG,), moving=False):
 
 class C(base.StellantisVehicleCoordinator):
     def __init__(self, d, sensors):
-        self._data = d; self._vehicle = {"vin":"VIN1","type":"Electric"}
+        self.data = d; self._vehicle = {"vin":"VIN1","type":"Electric"}
         self._sensors = dict(sensors); self._dropped_programs = set(); self._programs_override = None; self._programs_override_at = None; self.sent = []
         self._manage_charge_limit_sent = False; self._last_trip = None
         self._update_interval_seconds = 60
@@ -35,7 +35,10 @@ class C(base.StellantisVehicleCoordinator):
 
 on = {"switch_clear_programs_automatically": True}
 def run(c):
-    asyncio.run(c.after_async_update_data()); return len(c.sent)
+    # As during a real update: the fresh data is passed in, self.data still
+    # holds the previous cycle (here: nothing yet).
+    new_data, c.data = c.data, None
+    asyncio.run(c.after_async_update_data(new_data)); return len(c.sent)
 
 # a run that ends clears only the slot it ran for, a later slot survives
 import datetime as _dt
@@ -78,7 +81,7 @@ print("already moving       -> no command")
 
 # nothing to clear -> no pointless command
 c = C(data("Disabled", programs=()), {**on, "preconditioning": "Disabled", "moving": False})
-c._data["kinetic"]["moving"] = True
+c.data["kinetic"]["moving"] = True
 assert run(c) == 0
 print("no programs set      -> no command")
 
@@ -102,4 +105,12 @@ c = C(data("Disabled", programs=(chain[0],)), {**on, "preconditioning": "Enabled
 run(c)
 assert c.sent[0][0] == "Clear preconditioning programs automatically", c.sent[0][0]
 print("labelled            ->", c.sent[0][0])
+
+# another command still pending: the clear is refused, the update must not fail
+class Busy(C):
+    async def send_command(self, n, s, m, retry=False):
+        raise base.ServiceValidationError(translation_domain="stellantis_vehicles", translation_key="command_already_pending")
+c = Busy(data("Disabled", programs=(chain[0],)), {**on, "preconditioning": "Disabled", "moving": False})
+run(c)
+print("command pending     -> update survives, retried next cycle")
 print("ALL OK")

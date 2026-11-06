@@ -12,7 +12,6 @@ from .base import ( StellantisBaseSensor, StellantisRestoreSensor )
 from .utils import ( get_datetime, sort_dict )
 
 from .const import (
-    DOMAIN,
     SENSORS_DEFAULT,
     VEHICLE_TYPE_ELECTRIC,
     VEHICLE_TYPE_HYBRID,
@@ -22,8 +21,11 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Read-only platform, all state is provided by the coordinator.
+PARALLEL_UPDATES = 0
+
 async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> None:
-    stellantis = hass.data[DOMAIN][entry.entry_id]
+    stellantis = entry.runtime_data
     entities = []
 
     vehicles = await stellantis.get_user_vehicles()
@@ -136,10 +138,10 @@ class StellantisLastTripSensor(StellantisRestoreSensor):
                 max_speed_kmh = float(last_trip["kinetic"]["maxSpeed"])
                 attributes["max_speed"] = str(round(max_speed_kmh, 2)) + " " + UnitOfSpeed.KILOMETERS_PER_HOUR
         if "energyConsumptions" in last_trip:
-            for consuption in last_trip["energyConsumptions"]:
-                if "type" not in consuption:
+            for consumption in last_trip["energyConsumptions"]:
+                if "type" not in consumption:
                     continue
-                if consuption["type"] == VEHICLE_TYPE_ELECTRIC:
+                if consumption["type"] == VEHICLE_TYPE_ELECTRIC:
                     consumption_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
                     avg_consumption_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR+"/100"+UnitOfLength.KILOMETERS
                     divide = 1000
@@ -150,10 +152,10 @@ class StellantisLastTripSensor(StellantisRestoreSensor):
                     consumption_unit_of_measurement = UnitOfVolume.LITERS
                     avg_consumption_unit_of_measurement = UnitOfVolume.LITERS+"/100"+UnitOfLength.KILOMETERS
                     divide = 100
-                if "consumption" in consuption and round(float(consuption["consumption"])/divide, 2) > 0:
-                    attributes[consuption["type"].lower() + "_consumption"] = str(round(float(consuption["consumption"])/divide, 2)) + " " + consumption_unit_of_measurement
-                if "avgConsumption" in consuption and round(float(consuption["avgConsumption"])/divide, 2) > 0:
-                    attributes[consuption["type"].lower() + "_avg_consumption"] = str(round(float(consuption["avgConsumption"])/divide, 2)) + " " + avg_consumption_unit_of_measurement
+                if "consumption" in consumption and round(float(consumption["consumption"])/divide, 2) > 0:
+                    attributes[consumption["type"].lower() + "_consumption"] = str(round(float(consumption["consumption"])/divide, 2)) + " " + consumption_unit_of_measurement
+                if "avgConsumption" in consumption and round(float(consumption["avgConsumption"])/divide, 2) > 0:
+                    attributes[consumption["type"].lower() + "_avg_consumption"] = str(round(float(consumption["avgConsumption"])/divide, 2)) + " " + avg_consumption_unit_of_measurement
         self._attr_extra_state_attributes = attributes
 
 # class StellantisTotalTripSensor(StellantisRestoreSensor):

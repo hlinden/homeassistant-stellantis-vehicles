@@ -16,7 +16,7 @@ base = importlib.import_module("stellantis_vehicles.base")
 
 class FakeCoordinator(base.StellantisVehicleCoordinator):
     def __init__(self, data):
-        self._data = data; self._vehicle = {"vin":"VIN1","type":"Electric"}
+        self.data = data; self._vehicle = {"vin":"VIN1","type":"Electric"}
         self._sensors = {}; self._dropped_programs = set(); self.sent = []
         self._programs_override = None; self._programs_override_at = None
     async def send_command(self, name, service, message, retry=False): self.sent.append((name, service, message))

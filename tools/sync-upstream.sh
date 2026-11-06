@@ -45,13 +45,13 @@ fi
 echo
 if ! git merge upstream/develop; then
     echo
-    echo "resolve the conflicts, then: git add -A && git commit && ./tests/run_all.sh"
+    echo "resolve the conflicts, then: git add -A && git commit && ./tests_fork/run_all.sh"
     echo "FORK.md lists what each hunk of this fork is for."
     exit 1
 fi
 
 echo
-./tests/run_all.sh || exit 1
+./tests_fork/run_all.sh || exit 1
 
 echo
 echo "merged and checked. Next: git push, then Redownload in HACS and restart."

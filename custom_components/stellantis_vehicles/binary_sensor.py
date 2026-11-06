@@ -7,14 +7,16 @@ from homeassistant.const import EntityCategory
 from .base import ( StellantisBaseBinarySensor, StellantisBaseEntity )
 
 from .const import (
-    DOMAIN,
     BINARY_SENSORS_DEFAULT
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+# Read-only platform, all state is provided by the coordinator.
+PARALLEL_UPDATES = 0
+
 async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> None:
-    stellantis = hass.data[DOMAIN][entry.entry_id]
+    stellantis = entry.runtime_data
     entities = []
 
     vehicles = await stellantis.get_user_vehicles()
@@ -32,7 +34,8 @@ async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> No
                         key = key,
                         translation_key = key,
                         icon = default_value.get("icon", None),
-                        device_class = default_value.get("device_class", None)
+                        device_class = default_value.get("device_class", None),
+                        entity_category = default_value.get("entity_category", None)
                     )
                     entities.extend([StellantisBaseBinarySensor(coordinator, description, default_value.get("value_map"), default_value.get("updated_at_map"), default_value.get("on_value", None))])
 
@@ -47,9 +50,33 @@ async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> No
             )
             entities.extend([StellantisRemoteCommandsBinarySensor(coordinator, description)])
 
+            description = BinarySensorEntityDescription(
+                name = "command_pending",
+                key = "command_pending",
+                translation_key = "command_pending",
+                icon = "mdi:progress-clock",
+                entity_category = EntityCategory.DIAGNOSTIC
+            )
+            entities.extend([StellantisCommandPendingBinarySensor(coordinator, description)])
+
     async_add_entities(entities)
 
 
 class StellantisRemoteCommandsBinarySensor(StellantisBaseEntity, BinarySensorEntity):
-    def coordinator_update(self):
-        self._attr_is_on = self._stellantis and self._stellantis._mqtt and self._stellantis._mqtt.is_connected()
+    @property
+    def is_on(self) -> bool:
+        """ MQTT connection state, same check as available_command. """
+        return bool(self._stellantis and self._stellantis._mqtt and self._stellantis._mqtt.is_connected() and self._stellantis._mqtt_connected)
+
+    def coordinator_update(self) -> None:
+        pass
+
+
+class StellantisCommandPendingBinarySensor(StellantisBaseEntity, BinarySensorEntity):
+    @property
+    def is_on(self) -> bool:
+        """ Pending remote command. """
+        return self._coordinator.pending_action
+
+    def coordinator_update(self) -> None:
+        pass

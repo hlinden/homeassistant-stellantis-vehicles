@@ -30,13 +30,14 @@ sys.meta_path.insert(0, Finder())
 
 # a few real behaviours needed by the code under test
 import homeassistant.exceptions as hae
-class ServiceValidationError(Exception):
+class HomeAssistantError(Exception):
     def __init__(self, *args, translation_domain=None, translation_key=None, translation_placeholders=None):
-        super().__init__(translation_key or "error")
+        super().__init__(*(args or (translation_key or "error",)))
         self.translation_key = translation_key
         self.translation_placeholders = translation_placeholders
-class ConfigEntryAuthFailed(Exception): pass
-class HomeAssistantError(Exception): pass
+# a subclass, as in Home Assistant
+class ServiceValidationError(HomeAssistantError): pass
+class ConfigEntryAuthFailed(HomeAssistantError): pass
 hae.ServiceValidationError = ServiceValidationError
 hae.ConfigEntryAuthFailed = ConfigEntryAuthFailed
 hae.HomeAssistantError = HomeAssistantError

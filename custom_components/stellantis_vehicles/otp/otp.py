@@ -13,12 +13,14 @@ from Crypto.Hash import SHA256
 
 from . import oaep
 from .load import IWData
+from ..utils import SENSITIVE_DATA_FILTER
 
 # pylint: disable=invalid-name
 CONFIG_NAME = "otp.bin"
 TIMEOUT_IN_S = 10
 
 logger = logging.getLogger(__name__)
+logger.addFilter(SENSITIVE_DATA_FILTER)
 
 
 def etree_to_dict(t):
@@ -126,7 +128,7 @@ class Otp:
 
         R0 = self.challenge + ";" + iw + ";" + self.get_serial()
         R1 = self.challenge + ";" + iw + ";" + self.data.iwK1
-        logger.debug("%s\n%s\n%s", R0, R1, R2)
+        logger.debug("Computed challenge response for action %s", self.action)
         return {"R0": hashlib.sha256(R0.encode("utf-8")).hexdigest(),
                 "R1": hashlib.sha256(R1.encode("utf-8")).hexdigest(),
                 "R2": hashlib.sha256(R2.encode("utf-8")).hexdigest()}
@@ -149,7 +151,7 @@ class Otp:
             mini = x * 128
             ciphertext = cipher.decrypt(enc_b[mini:maxi])
             dec_string += ciphertext.hex()
-        logger.debug(dec_string)
+        logger.debug("Decrypted %d bytes", len(dec_string) // 2)
         return dec_string
 
     def request(self, param, setup=False):
@@ -171,9 +173,9 @@ class Otp:
             if setup:
                 return etree_to_dict(ElT.XML(raw_xml))["ActionSetup"]
             return etree_to_dict(ElT.XML(raw_xml))["ActionFinalize"]
-        except KeyError:
-            logger.debug(raw_xml)
-            raise ValueError("Bad response from server") from KeyError
+        except KeyError as e:
+            logger.debug("Unexpected response (%d chars)", len(raw_xml))
+            raise ValueError("Bad response from server") from e
 
     def activation_start(self):
         param = {"action": "ActionSetup", "mode": self.mode, "id": self.data.iwid, "lastsync": self.data.iwTsync,
@@ -217,8 +219,8 @@ class Otp:
         if self.mode == Otp.OTP_MODE:
             try:
                 self.defi = str(xml["defi"])
-            except KeyError:
-                raise ConfigException from KeyError
+            except KeyError as e:
+                raise ConfigException("Missing 'defi' in OTP response") from e
             if "J" in xml:
                 logger.debug("Need another otp request")
                 return Otp.OTP_TWICE
@@ -269,13 +271,18 @@ class Otp:
         try:
             if self.activation_start():
                 res = self.activation_finalyze()
-                if res != Otp.NOK:
+                # activation_finalyze() never actually returns Otp.NOK - on failure
+                # it returns the server's raw error string instead (see its "err"
+                # check above), so comparing against NOK let every failure through
+                # as if it had succeeded. Check for the two real success values.
+                if res in (Otp.OK, Otp.OTP_TWICE):
                     if res == Otp.OTP_TWICE:
                         self.mode = Otp.OTP_MODE
                         self.activation_start()
                         assert self.activation_finalyze() == Otp.OK
                     otp_code = self._get_otp_code()
                     assert otp_code is not None
+                    SENSITIVE_DATA_FILTER.add_custom_value(otp_code)
                     logger.debug("otp code: %s", otp_code)
         except AssertionError as e:
             raise ConfigException("Can't get otp code") from e

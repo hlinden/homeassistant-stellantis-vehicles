@@ -7,7 +7,6 @@ from homeassistant.const import EntityCategory
 from .base import ( StellantisBaseSwitch, StellantisPreconditioningProgramEntity )
 
 from .const import (
-    DOMAIN,
     VEHICLE_TYPE_ELECTRIC,
     VEHICLE_TYPE_HYBRID,
     PRECONDITIONING_PROGRAM_SLOTS
@@ -15,8 +14,11 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Serialize command calls so a bulk action can't flood the Stellantis cloud.
+PARALLEL_UPDATES = 1
+
 async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> None:
-    stellantis = hass.data[DOMAIN][entry.entry_id]
+    stellantis = entry.runtime_data
     entities = []
 
     vehicles = await stellantis.get_user_vehicles()
@@ -76,7 +78,8 @@ async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> No
 class StellantisBatteryChargingLimitSwitch(StellantisBaseSwitch):
     @property
     def available(self):
-        return super().available and self._coordinator._sensors.get("number_battery_charging_limit", False)
+        return super().available and self._coordinator._sensors.get("number_battery_charging_limit", False) and self._coordinator._sensors.get("battery_charging_limit", None) != "Partial"
+
 
 class StellantisAbrpSyncSwitch(StellantisBaseSwitch):
     @property

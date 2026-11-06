@@ -16,7 +16,7 @@ base = importlib.import_module("stellantis_vehicles.base")
 
 class C(base.StellantisVehicleCoordinator):
     def __init__(self, d):
-        self._data = d; self._vehicle = {"vin":"VIN1","type":"Electric"}
+        self.data = d; self._vehicle = {"vin":"VIN1","type":"Electric"}
         self._sensors = {}; self._dropped_programs = set(); self.sent = []
         self._programs_override = None; self._programs_override_at = None
     async def send_command(self, n, s, m, retry=False): self.sent.append((n, s, m))

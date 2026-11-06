@@ -25,7 +25,7 @@ class Description:
 
 class FakeCoordinator(base.StellantisVehicleCoordinator):
     def __init__(self, data):
-        self._data = data
+        self.data = data
         self._hass = None
         self._config = {}
         self._vehicle = {"vin": "VF1TESTVIN0000001", "type": "Electric"}

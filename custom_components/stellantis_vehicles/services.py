@@ -52,7 +52,9 @@ def get_coordinators(hass: HomeAssistant, device_ids):
                 if identifier[0] != DOMAIN:
                     continue
                 for entry_id in device.config_entries:
-                    stellantis = hass.data.get(DOMAIN, {}).get(entry_id)
+                    entry = hass.config_entries.async_get_entry(entry_id)
+                    # runtime_data is None while an entry is not (or no longer) loaded
+                    stellantis = entry.runtime_data if entry and entry.domain == DOMAIN else None
                     if stellantis:
                         coordinator = stellantis.async_get_coordinator_by_vin(identifier[1])
                         if coordinator:

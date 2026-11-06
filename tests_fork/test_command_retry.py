@@ -30,11 +30,12 @@ class FakeStellantis:
 
 class C(base.StellantisVehicleCoordinator):
     def __init__(self):
-        self._data = {"preconditionning": {"airConditioning": {"status": "Disabled", "programs": []}}}
+        self.data = {"preconditionning": {"airConditioning": {"status": "Disabled", "programs": []}}}
         self._vehicle = {"vin": "VIN1", "type": "Electric"}
         self._sensors = {}
         self._dropped_programs = set()
         self._commands_history = {}
+        self._pending_action_id = None
         self._disabled_commands = []
         self._programs_override = None
         self._programs_override_at = None

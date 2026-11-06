@@ -1,9 +1,12 @@
-import logging
 import asyncio
+import json
+import logging
+from collections import deque
 from datetime import UTC, datetime, time, timedelta
-from asyncio import Semaphore
+from time import monotonic, process_time
 from functools import wraps
 import re
+import weakref
 from typing import Any, Dict
 
 from homeassistant.util import dt
@@ -13,6 +16,8 @@ from .exceptions import RateLimitException
 from .const import (
     DOMAIN,
     FIELD_ANONYMIZE_LOGS,
+    MQTT_RESP_DATA_ERROR_CODES,
+    MQTT_CHARGING_RESP_DATA_ERROR_CODES,
     PRECONDITIONING_PROGRAM_DAYS,
     PRECONDITIONING_PROGRAM_DISABLED_HOUR,
     PRECONDITIONING_PROGRAM_DISABLED_MINUTE
@@ -30,18 +35,36 @@ def get_datetime(date = None):
 def datetime_from_isoformat(string):
     return get_datetime(datetime.fromisoformat(string))
 
+def parse_timestamp(value:Any) -> datetime | None:
+    """ Parse an API/MQTT ISO timestamp, assuming UTC if naive; None if missing or invalid. """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
 def time_from_pt_string(pt_string):
-    regex = 'PT'
-    if pt_string.find("H") != -1:
-        regex = regex + "%HH"
-    if pt_string.find("M") != -1:
-        regex = regex + "%MM"
-    if pt_string.find("S") != -1:
-        regex = regex + "%SS"
-    return datetime.strptime(pt_string, regex).time()
+    try:
+        regex = 'PT'
+        if pt_string.find("H") != -1:
+            regex = regex + "%HH"
+        if pt_string.find("M") != -1:
+            regex = regex + "%MM"
+        if pt_string.find("S") != -1:
+            regex = regex + "%SS"
+        return datetime.strptime(pt_string, regex).time()
+    except (AttributeError, TypeError, ValueError) as e:
+        _LOGGER.warning("Could not parse duration '%s': %s", pt_string, e)
+        return None
 
 def time_from_string(string):
-    return datetime.strptime(string, "%H:%M:%S").time()
+    try:
+        return datetime.strptime(string, "%H:%M:%S").time()
+    except (AttributeError, TypeError, ValueError) as e:
+        _LOGGER.warning("Could not parse time '%s': %s", string, e)
+        return None
 
 def date_from_pt_string(pt_string, start_date=None):
     if not start_date:
@@ -53,6 +76,30 @@ def date_from_pt_string(pt_string, start_date=None):
     except Exception as e:
         _LOGGER.warning(str(e))
         return None
+
+def vehicle_removed_issue_id(vin:str) -> str:
+    return f"vehicle_removed_{vin}"
+
+def extract_oauth_code(value:str) -> str:
+    """Return only the authorization code.
+
+    Users paste the redirect URL, `code=...&scope=...` or `<code>&scope=...`;
+    a stray `scope` makes the token endpoint reject the request. The code is
+    returned as pasted (still percent-encoded), as it goes into a query string.
+    """
+    value = value.strip()
+    match = re.search(r"(?:^|[?&])code=([^&#\s]+)", value)
+    return match.group(1) if match else value.split("&", 1)[0]
+
+def resolve_mqtt_resp_data_error(service:str | None, resp_data:dict[str, Any], default:str) -> str:
+    """ Failure reason from the resp_data of an MQTT command response, or default when it has none. """
+    if not service:
+        return default
+    error_fields = MQTT_CHARGING_RESP_DATA_ERROR_CODES if service.startswith("/VehCharge") else MQTT_RESP_DATA_ERROR_CODES.get(service, {})
+    for field, codes in error_fields.items():
+        if (error_code := resp_data.get(field)) is not None:
+            return codes.get(error_code, default)
+    return default
 
 def preconditioning_days_from_string(string):
     """ Convert a "Mon,Tue" day list to the 7 items day mask used by the API. """
@@ -90,6 +137,28 @@ def replace_string_placeholders(string, placeholders=None):
         string = string.replace("{" + placeholder + "}", str(value))
     return string
 
+def parse_vehicle_rights(response:Any) -> dict[str, dict[str, Any]]:
+    """Flatten a vehicle rights response into {fds code: {"name", "mqtt_services"}}.
+
+    The services come grouped per telematics unit; a code listed under more
+    than one unit is kept once.
+    """
+    features:dict[str, dict[str, Any]] = {}
+    services_by_unit = response.get("services") if isinstance(response, dict) else None
+    if not isinstance(services_by_unit, dict):
+        return features
+    for services in services_by_unit.values():
+        for service in services or []:
+            if not isinstance(service, dict):
+                continue
+            code = service.get("code")
+            if code and code not in features:
+                features[code] = {
+                    "name": service.get("name"),
+                    "mqtt_services": service.get("mqtt_services") or [],
+                }
+    return features
+
 def sort_dict(items, ordered_keys=None):
     if ordered_keys is None or not isinstance(ordered_keys, list):
         return items
@@ -99,60 +168,230 @@ def sort_dict(items, ordered_keys=None):
             result[key] = items[key]
     return result
 
+def log_call(func):
+    """Log entry and exit of a function at debug level.
+
+    Replaces the hand-written ``---------- START`` / ``---------- END`` markers.
+    Works on coroutine functions and plain functions alike (the latter for the
+    synchronous paho-mqtt callbacks). The exit line runs from a ``finally``
+    block, so it also covers the paths that return early or raise. Entry/exit
+    are logged under the decorated function's own module logger, so the lines
+    stay next to that module's other logging.
+    """
+    logger = logging.getLogger(func.__module__)
+    name = func.__name__
+
+    if asyncio.iscoroutinefunction(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            logger.debug("---------- START %s", name)
+            start_time = monotonic()
+            process_start_time = process_time()
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                duration = monotonic() - start_time
+                process_duration = process_time() - process_start_time
+                logger.debug(
+                    "---------- END %s (duration=%.3fs, cpu=%.3fs)",
+                    name, duration, process_duration
+                )
+    else:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            logger.debug("---------- START %s", name)
+            start_time = monotonic()
+            process_start_time = process_time()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                duration = monotonic() - start_time
+                process_duration = process_time() - process_start_time
+                logger.debug(
+                    "---------- END %s (duration=%.3fs, cpu=%.3fs)",
+                    name, duration, process_duration
+                )
+
+    return wrapper
+
+
 def rate_limit(limit: int, every: int):
+    """Reject calls once `limit` of them have been attempted within the last
+    `every` seconds, counted per owner (the bound instance in args[0]).
+
+    Each owner has its own window: one StellantisVehicles per config entry,
+    one coordinator per vehicle. A single shared window let one account
+    exhaust the budget of the others. Attempts are counted, failures
+    included - that is what bounds retries while the API keeps failing.
+    No background tasks are involved, so there is nothing to cancel on unload.
+    """
     def limit_decorator(func):
-        semaphore = Semaphore(limit)
-        
-        async def release_after_delay():
-            await asyncio.sleep(every)
-            semaphore.release()
-        
+        # Weak keys: a reloaded entry gets a fresh window and nothing leaks.
+        windows: "weakref.WeakKeyDictionary[Any, deque[float]]" = weakref.WeakKeyDictionary()
+        fallback: dict[int, deque[float]] = {}
+
+        def _window(owner) -> deque[float]:
+            try:
+                return windows.setdefault(owner, deque())
+            except TypeError:
+                return fallback.setdefault(id(owner), deque())
+
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
-            if semaphore._value <= 0:
-                _LOGGER.debug(f"Rate limit exceeded {func.__name__}: max {limit} per {every}s")
+            calls = _window(args[0] if args else None)
+            now = monotonic()
+            while calls and now - calls[0] >= every:
+                calls.popleft()
+            if len(calls) >= limit:
+                _LOGGER.debug("Rate limit exceeded %s: max %s per %ss", func.__name__, limit, every)
                 raise RateLimitException("rate_limit")
 
-            await semaphore.acquire()
-            asyncio.create_task(release_after_delay())
+            calls.append(now)
             return await func(*args, **kwargs)
-        
+
         return async_wrapper
-    
+
     return limit_decorator
 
 class SensitiveDataFilter(logging.Filter):
-    def __init__(self):
+    """Mask sensitive strings (tokens, VINs, customer ids) in log records.
+
+    A single shared instance sits on each of this integration's module loggers
+    (attached once, at import time). It therefore has to hold the sensitive
+    values of *every* loaded config entry at once, and it must not let that set
+    grow without bound over the process lifetime - both points were behind the
+    runaway CPU use in issue #414.
+
+    Design:
+    - ``_entry_values`` keeps, per ``entry_id``, the set of sensitive strings
+      extracted from that entry's stored config. It is *replaced* wholesale on
+      every ``set_entry_values`` call (the integration wires that to every
+      ``save_config``), so a rotated oauth/mqtt token supersedes the previous
+      one instead of piling up. Keyed by ``entry_id`` so several accounts do
+      not overwrite each other's tokens.
+    - ``_entry_extra`` keeps, per ``entry_id``, values that never reach the
+      stored config but must stay masked for the entry's whole lifetime (the
+      account's VINs and vehicle ids from the live vehicle list). Populated
+      by ``set_entry_extra_values``, kept separate from ``_entry_values`` so
+      a later config snapshot cannot drop it, and out of the bounded
+      ``_custom_values`` below so it is never evicted.
+    - ``_custom_values`` is a bounded, insertion-ordered set, filled by
+      ``add_custom_value``, for values seen outside the stored config that
+      are not (yet) tied to a loaded entry (the OAuth code / id_token during
+      the auth flow, before ``set_entry`` has run). It is capped because
+      those values rotate; anything that must stay masked for an entry's
+      lifetime lives in ``_entry_values`` or ``_entry_extra`` instead.
+    - Every mutating method rebinds its container instead of mutating it in
+      place, so the filter can be read from the paho-mqtt network thread while
+      the event loop updates it, without a "changed size during iteration".
+    - ``REDACT_KEYS`` is a different mechanism: a value under one of these keys
+      (GPS position, ABRP telemetry) is replaced wholesale regardless of its
+      content. Unlike the value-based masking above, these values change on
+      every read, so there is no specific string to register and match.
+    - ``_PAGE_TOKEN_RE`` masks a pagination token wherever it appears as
+      ``pageToken=...`` in a logged string, e.g. in the ``_links.*.href``
+      URLs the API echoes back. Those hrefs turn up in more than one
+      endpoint's response, so this is matched unconditionally instead of
+      registering every token value seen.
+    """
+
+    MASKED_ENTRY_KEYS = ("access_token", "refresh_token", "oauth_code", "customer_id", "text_abrp_token")
+    CUSTOM_VALUES_LIMIT = 128
+    REDACT_KEYS = ("lastPosition", "coordinates", "latitude", "longitude", "tlm", "notification_url")
+    _PAGE_TOKEN_RE = re.compile(r"(pageToken=)[^&\"'\s]+")
+
+    def __init__(self) -> None:
         super().__init__()
-        self.custom_values = []
-        self.entry_data = {}
-        self.masked_entry_keys = ["access_token", "refresh_token", "oauth_code", "customer_id"]
+        self._entry_values: dict[str, set[str]] = {}
+        # Extra always-mask values per entry (the account's VINs and vehicle ids
+        # from the live API). Kept separate from _entry_values so a later
+        # set_entry_values() config snapshot cannot drop them, and out of the
+        # bounded _custom_values FIFO so they are never evicted while the entry
+        # is loaded.
+        self._entry_extra: dict[str, set[str]] = {}
+        self._entry_anonymize: dict[str, bool] = {}
+        self._custom_values: dict[str, None] = {}
+        self._pattern_cache: re.Pattern[str] | None = None
+
+    def set_entry_values(self, entry_id:str, entry_data:dict[str, Any] | None) -> None:
+        """Store (replacing any previous snapshot) one config entry's sensitive
+        values and its anonymize flag."""
+        entry_data = entry_data or {}
+        values = {str(v) for v in self.get_masked_values(entry_data) if v}
+        # VINs are the *keys* of the per-vehicle config node, not values, so
+        # get_masked_values() does not see them.
+        values |= {str(vin) for vin in (entry_data.get("vehicles") or {}) if vin}
+        self._entry_values = {**self._entry_values, entry_id: values}
+        self._entry_anonymize = {
+            **self._entry_anonymize,
+            entry_id: bool(entry_data.get(FIELD_ANONYMIZE_LOGS, False)),
+        }
         self._pattern_cache = None
 
-    def add_custom_value(self, value):
-        self.custom_values.append(value)
-        self._pattern_cache = None
-
-    def add_entry_values(self, entry_data):
-        self.entry_data = entry_data
-        self._pattern_cache = None
-
-    def get_masked_values(self, data, result=None):
+    def get_masked_values(self, data:dict[str, Any], result:list[Any] | None = None) -> list[Any]:
+        """Collect the values of any MASKED_ENTRY_KEYS key found anywhere in a (possibly nested) config dict."""
         if result is None:
             result = []
         for key, value in data.items():
-            if isinstance(data[key], dict):
-                self.get_masked_values(data[key], result)
-            if key in self.masked_entry_keys:
+            if isinstance(value, dict):
+                self.get_masked_values(value, result)
+            if key in self.MASKED_ENTRY_KEYS:
                 result.append(value)
         return result
 
+    def set_entry_extra_values(self, entry_id:str, values:set[str]) -> None:
+        """Register extra always-mask values for an entry (its account's VINs
+        and vehicle ids from the live vehicle list). Replaces the previous set
+        for that entry."""
+        self._entry_extra = {
+            **self._entry_extra,
+            entry_id: {str(v) for v in values if v},
+        }
+        self._pattern_cache = None
+
+    def add_custom_value(self, value:Any) -> None:
+        """Add one value to the bounded FIFO of extra masked strings, dropping the oldest once CUSTOM_VALUES_LIMIT is exceeded."""
+        if not value:
+            return
+        text = str(value)
+        if text in self._custom_values:
+            return
+        updated = dict(self._custom_values)
+        updated[text] = None
+        while len(updated) > self.CUSTOM_VALUES_LIMIT:
+            del updated[next(iter(updated))]
+        self._custom_values = updated
+        self._pattern_cache = None
+
+    def remove_entry_values(self, entry_id:str) -> None:
+        """Forget a config entry on unload: drop its values from both
+        _entry_values and _entry_extra, so its now-invalid tokens and VINs
+        stop being masked and the compiled pattern shrinks back. Once no
+        entry remains, also clears the shared _custom_values FIFO."""
+        if entry_id not in self._entry_values and entry_id not in self._entry_extra:
+            return
+        self._entry_values = {k: v for k, v in self._entry_values.items() if k != entry_id}
+        self._entry_extra = {k: v for k, v in self._entry_extra.items() if k != entry_id}
+        self._entry_anonymize = {k: v for k, v in self._entry_anonymize.items() if k != entry_id}
+        # Nothing loaded any more -> drop the process-global extras too.
+        if not self._entry_values and not self._entry_extra:
+            self._custom_values = {}
+        self._pattern_cache = None
+
     @property
-    def compiled_patterns(self):
+    def compiled_patterns(self) -> re.Pattern[str] | None:
+        """Return (and cache) a compiled regex matching every currently tracked value (from loaded entries plus the custom-values FIFO), or None when there is nothing to mask."""
         if self._pattern_cache is not None:
             return self._pattern_cache
-        sensitive_values = self.get_masked_values(self.entry_data) + self.custom_values
-        valid_values = {str(v) for v in sensitive_values if v}
+        # Snapshot the container references once - they may be rebound from
+        # another thread while this runs.
+        entry_values = self._entry_values
+        entry_extra = self._entry_extra
+        valid_values = set(self._custom_values)
+        for group in (entry_values, entry_extra):
+            for values in group.values():
+                valid_values |= values
+        valid_values = {v for v in valid_values if v}
         if not valid_values:
             self._pattern_cache = None
             return None
@@ -162,7 +401,8 @@ class SensitiveDataFilter(logging.Filter):
         return self._pattern_cache
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if self.entry_data.get(FIELD_ANONYMIZE_LOGS, False):
+        """Redact masked values in the record's message and args when any loaded entry enabled anonymization; always returns True, so no record is ever dropped."""
+        if any(self._entry_anonymize.values()):
             record.msg = self._mask_value(record.msg)
             if record.args:
                 if isinstance(record.args, dict):
@@ -172,14 +412,10 @@ class SensitiveDataFilter(logging.Filter):
                 else:
                     record.args = self._mask_value(record.args)
 
-            # record.msg = self._mask_value(record.msg)
-            # if hasattr(record, 'msg') and record.args:
-            #     record.msg = record.getMessage()
-            #     record.args = None
-
         return True
 
     def _mask_value(self, value: Any) -> Any:
+        """Return the value with masked strings redacted, recursing into dict / list / tuple, decoding bytes / bytearray, and stringifying exceptions."""
         if value is None:
             return value
 
@@ -189,23 +425,55 @@ class SensitiveDataFilter(logging.Filter):
             return type(value)(self._mask_value(item) for item in value)
         elif isinstance(value, str):
             return self._mask_string(value)
+        elif isinstance(value, (bytes, bytearray)):
+            # MQTT payloads are logged as raw bytes. If they parse as JSON,
+            # mask the parsed structure (so REDACT_KEYS also applies there);
+            # otherwise fall back to substring-masking the decoded text.
+            text = value.decode("utf-8", "replace")
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                masked_parsed = self._mask_value(parsed)
+                # Compare structurally, not the reformatted JSON string, so an
+                # untouched payload keeps its exact original bytes.
+                if masked_parsed == parsed:
+                    return value
+                return json.dumps(masked_parsed).encode("utf-8", "replace")
+            masked = self._mask_string(text)
+            return value if masked == text else masked.encode("utf-8", "replace")
+        elif isinstance(value, BaseException):
+            return self._mask_string(str(value))
 
         return value
 
     def _mask_dict(self, data: Dict) -> Dict:
+        """Return a new dict with every key and value passed through _mask_value.
+
+        A key in REDACT_KEYS is the exception: when its value is truthy, that
+        value is replaced wholesale instead of being recursed into or
+        substring-matched (see REDACT_KEYS).
+        """
         masked = {}
         for key, value in data.items():
             masked_key = self._mask_value(key)
-            masked[masked_key] = self._mask_value(value)
+            if key in self.REDACT_KEYS and value:
+                masked[masked_key] = "###"
+            else:
+                masked[masked_key] = self._mask_value(value)
         return masked
 
     def _mask_string(self, value: str) -> str:
+        """Return the string with every occurrence of a masked value replaced by its redacted form."""
+        value = self._PAGE_TOKEN_RE.sub(r"\1###", value)
         pattern = self.compiled_patterns
         if pattern:
             return pattern.sub(lambda m: self._mask_sensitive_value(m.group(0)), value)
         return value
 
     def _mask_sensitive_value(self, value: Any) -> str:
+        """Redact one matched value: '###' when empty or five characters or shorter, otherwise its first five characters followed by '###'."""
         if value is None or value == '':
             return '###'
 
@@ -214,3 +482,7 @@ class SensitiveDataFilter(logging.Filter):
             return '###'
 
         return f"{value_str[:5]}###"
+
+
+# The shared filter instance; see the class docstring above for the design.
+SENSITIVE_DATA_FILTER = SensitiveDataFilter()

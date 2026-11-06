@@ -16,7 +16,7 @@ base = importlib.import_module("stellantis_vehicles.base")
 
 class FakeCoordinator(base.StellantisVehicleCoordinator):
     def __init__(self, data):
-        self._data = data
+        self.data = data
         self._vehicle = {"vin": "VIN1", "type": "Electric"}
         self._sensors = {}
         self._dropped_programs = set(); self._programs_override = None; self._programs_override_at = None
@@ -50,9 +50,18 @@ class Services:
     def has_service(self, domain, service): return service in self.registered
     def async_register(self, domain, service, func, schema=None): self.registered[service] = func
 
+class Entry:
+    domain = "stellantis_vehicles"
+    def __init__(self, runtime_data): self.runtime_data = runtime_data
+
+class ConfigEntries:
+    def __init__(self, entries): self.entries = entries
+    def async_get_entry(self, entry_id): return self.entries.get(entry_id)
+
 class Hass:
     def __init__(self):
-        self.data = {"stellantis_vehicles": {"entry1": FakeStellantis()}}
+        self.data = {}
+        self.config_entries = ConfigEntries({"entry1": Entry(FakeStellantis())})
         self.services = Services()
 
 import homeassistant.helpers as helpers
@@ -83,6 +92,15 @@ try:
     raise SystemExit("expected error")
 except stub.ServiceValidationError as e:
     print("unknown device ->", e.translation_key, e.translation_placeholders)
+
+# a device whose config entry is not loaded
+hass.config_entries.entries["entry1"].runtime_data = None
+try:
+    asyncio.run(handler(Call({"device_id": ["dev1"], "slot": 1})))
+    raise SystemExit("expected error")
+except stub.ServiceValidationError as e:
+    print("entry not loaded ->", e.translation_key)
+hass.config_entries.entries["entry1"].runtime_data = FakeStellantis()
 
 # invalid day name from an automation
 try:

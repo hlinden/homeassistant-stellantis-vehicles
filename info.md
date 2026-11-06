@@ -1,5 +1,5 @@
 # HomeAssistant - Stellantis Vehicles
-[![Active installations](https://img.shields.io/badge/active_installations-7463-%2318BCF2?style=for-the-badge&logo=homeassistant)](#)  
+[![Active installations](https://img.shields.io/badge/active_installations-8879-%2318BCF2?style=for-the-badge&logo=homeassistant)](#)  
 [![Last version](https://img.shields.io/github/v/release/andreadegiovine/homeassistant-stellantis-vehicles?style=for-the-badge&logo=github&label=last%20version&color=green)](#)
 
 - [Requirements](#requirements)
@@ -302,22 +302,25 @@ Dieter
 SA Energy  
 <sub>*and other heroes*</sub>
 
+**⭐ 4 BEERS**  
+Al  
+
 **⭐ 3 BEERS**  
+Adam Szczerba  
 Hubert  
 Someone  
-Mark  
 <sub>*and other heroes*</sub>
 
 **⭐ 2 BEERS**  
+Ludvik  
 Liam  
 Kristian  
-Dave  
 <sub>*and other heroes*</sub>
 
 **⭐ 1 BEERS**  
-Someone  
-lmz  
-Someone  
+Fritz  
+Carl-Magnus Johansson  
+Harald  
 <sub>*and other heroes*</sub>
 
 ### Want to join the Club?

@@ -1,4 +1,5 @@
 import logging
+from datetime import time
 
 from homeassistant.core import HomeAssistant
 from homeassistant.components.time import TimeEntityDescription
@@ -7,7 +8,6 @@ from .base import ( StellantisBaseTime, StellantisPreconditioningProgramEntity )
 from .utils import preconditioning_program_time
 
 from .const import (
-    DOMAIN,
     VEHICLE_TYPE_ELECTRIC,
     VEHICLE_TYPE_HYBRID,
     PRECONDITIONING_PROGRAM_SLOTS
@@ -15,8 +15,11 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Serialize command calls so a bulk action can't flood the Stellantis cloud.
+PARALLEL_UPDATES = 1
+
 async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> None:
-    stellantis = hass.data[DOMAIN][entry.entry_id]
+    stellantis = entry.runtime_data
     entities = []
 
     vehicles = await stellantis.get_user_vehicles()
@@ -54,11 +57,11 @@ class StellantisBatteryChargingStart(StellantisBaseTime):
     def available(self):
         return self.available_command
 
-    async def async_set_value(self, value):
+    async def async_set_value(self, value:time) -> None:
         self._attr_native_value = value
         self._coordinator._sensors[self._sensor_key] = value
         await self._coordinator.send_charge_command(self.name, True)
-        await self._coordinator.async_refresh()
+        await self._coordinator.async_request_refresh()
 
     def coordinator_update(self):
         if self.value_was_updated():
