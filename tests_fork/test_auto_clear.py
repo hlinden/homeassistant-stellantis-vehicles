@@ -22,10 +22,10 @@ def data(status="Disabled", programs=(PROG,), moving=False):
 class C(base.StellantisVehicleCoordinator):
     def __init__(self, d, sensors):
         self.data = d; self._vehicle = {"vin":"VIN1","type":"Electric"}
-        self._sensors = dict(sensors); self._dropped_programs = set(); self._programs_override = None; self._programs_override_at = None; self.sent = []
+        self._sensors = dict(sensors); self._dropped_programs = set(); self._programs_override = None; self._programs_override_at = None; self._programs_override_action_id = None; self._auto_clear_action_id = None; self._auto_clear_failures = 0; self._auto_clear_next_at = None; self._auto_clear_last_status = None; self.sent = []
         self._manage_charge_limit_sent = False; self._last_trip = None
         self._update_interval_seconds = 60
-    async def send_command(self, n, s, m, retry=False): self.sent.append((n, s, m))
+    async def send_command(self, n, s, m, retry=False, internal=False): self.sent.append((n, s, m))
     async def async_refresh(self): pass
     async def get_vehicle_last_trip(self): pass
     def get_translation(self, path, default=None):
@@ -108,7 +108,7 @@ print("labelled            ->", c.sent[0][0])
 
 # another command still pending: the clear is refused, the update must not fail
 class Busy(C):
-    async def send_command(self, n, s, m, retry=False):
+    async def send_command(self, n, s, m, retry=False, internal=False):
         raise base.ServiceValidationError(translation_domain="stellantis_vehicles", translation_key="command_already_pending")
 c = Busy(data("Disabled", programs=(chain[0],)), {**on, "preconditioning": "Disabled", "moving": False})
 run(c)

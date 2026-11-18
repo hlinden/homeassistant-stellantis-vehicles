@@ -20,6 +20,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.const import ( STATE_UNAVAILABLE, STATE_UNKNOWN, STATE_ON, STATE_OFF)
 from homeassistant.exceptions import ( ConfigEntryAuthFailed, HomeAssistantError, ServiceValidationError )
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers import device_registry as dr
 
 from .mqtt_event import event_content
 from .utils import ( time_from_pt_string, get_datetime, date_from_pt_string, time_from_string, parse_timestamp, rate_limit, log_call, parse_vehicle_rights, vehicle_removed_issue_id, SENSITIVE_DATA_FILTER, preconditioning_program_time )
@@ -43,7 +44,11 @@ from .const import (
     PRECONDITIONING_PROGRAM_DISABLED_HOUR,
     PRECONDITIONING_PROGRAM_DISABLED_MINUTE,
     PRECONDITIONING_PROGRAMS_OVERRIDE_TTL,
-    COMMAND_RETRY_DELAY
+    PRECONDITIONING_AUTO_CLEAR_BACKOFF,
+    PRECONDITIONING_AUTO_CLEAR_NOTIFY_AFTER,
+    COMMAND_RETRY_DELAY,
+    COMMAND_STATUS_SUCCESS,
+    COMMAND_STATUS_NOTIFY
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -102,6 +107,14 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._dropped_programs = set()
         self._programs_override = None
         self._programs_override_at = None
+        # The command that wrote the override, see _programs_override_is_current
+        self._programs_override_action_id = None
+        # Automatic clear: the attempt in flight, failed attempts in a row and
+        # when the next one may be made (see _auto_clear_preconditioning_programs)
+        self._auto_clear_action_id = None
+        self._auto_clear_failures = 0
+        self._auto_clear_next_at = None
+        self._auto_clear_last_status = None
 
     @property
     def supported_features(self) -> dict[str, dict[str, Any]] | None:
@@ -485,10 +498,10 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         """ Preconditioning running state. """
         return self.get_preconditioning_is_running()
 
-    def get_spent_program_slots(self, data = None):
+    def get_spent_program_slots(self, data = None, use_override = True):
         """ Slots set for today whose time has already passed. """
         now = get_datetime()
-        programs = self.get_programs(data)
+        programs = self.get_programs(data, use_override)
         result = []
         for slot in PRECONDITIONING_PROGRAM_SLOTS:
             program = programs[f"program{slot}"]
@@ -504,9 +517,9 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         """ Slots set for today whose time has already passed. """
         return self.get_spent_program_slots()
 
-    def get_preconditioning_programs_are_set(self, data = None):
+    def get_preconditioning_programs_are_set(self, data = None, use_override = True):
         """ True while at least one slot holds something other than the placeholder. """
-        for program in self.get_programs(data).values():
+        for program in self.get_programs(data, use_override).values():
             if program["on"] or any(program["day"]) or preconditioning_program_time(program) is not None:
                 return True
         return False
@@ -539,28 +552,105 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
             oldest_id = next(iter(self._commands_history))
             del self._commands_history[oldest_id]
 
-    async def update_command_history(self, action_id: str, update: str | None = None) -> None:
-        """ Update command history. """
+    def _final_command(self, action_id):
+        """ The command that carries on for action_id: itself, or its resend. """
+        seen = set()
+        command = self._commands_history.get(action_id)
+        while command is not None and command.get("resent_as") and action_id not in seen:
+            seen.add(action_id)
+            action_id = command["resent_as"]
+            command = self._commands_history.get(action_id)
+        return command
+
+    def _command_last_activity(self, command):
+        """ When anything was last heard of command. """
+        return command["updates"][-1]["date"] if command["updates"] else command["sent_at"]
+
+    def _command_outcome(self, action_id):
+        """ "in_progress", "complete" or "failed" for action_id, following resends.
+
+        A command nothing has been heard of for PRECONDITIONING_PROGRAMS_OVERRIDE_TTL
+        counts as failed, and so does one that has dropped out of the history.
+        """
+        command = self._final_command(action_id)
+        if command is None:
+            return "failed"
+        if command.get("resend_pending"):
+            return "in_progress"
+        last = command["updates"][-1]["info"] if command["updates"] else None
+        if last in COMMAND_STATUS_SUCCESS:
+            return "complete"
+        if last is None or last in COMMAND_STATUS_STILL_IN_PROGRESS:
+            if (get_datetime() - self._command_last_activity(command)).total_seconds() > PRECONDITIONING_PROGRAMS_OVERRIDE_TTL:
+                return "failed"
+            return "in_progress"
+        return "failed"
+
+    async def update_command_history(self, action_id: str, update: str | None = None, result_code: str | None = None) -> None:
+        """ Update command history.
+
+        result_code is the code as the platform sent it, before resp_data
+        turned it into a failure reason; it decides whether the user is told.
+        """
         if action_id not in self._commands_history:
             return
         if update:
-            self._commands_history[action_id]["updates"].append({"info": update, "date": get_datetime()})
+            command = self._commands_history[action_id]
+            command["updates"].append({"info": update, "date": get_datetime()})
+            name = command["name"]
+            # Decided before the retry below is taken: a timeout that is about
+            # to be resent has not failed yet.
+            will_resend = update == "300" and "retry" in command
             if update == "not_compatible":
-                disabled_name = self._commands_history[action_id]["name"]
-                if disabled_name not in self._disabled_commands:
-                    self._disabled_commands.append(disabled_name)
-            elif update == "300" and "retry" in self._commands_history[action_id]:
+                if name not in self._disabled_commands:
+                    self._disabled_commands.append(name)
+            elif will_resend:
                 # The vehicle was asleep and the command went nowhere. The platform
                 # already tried to wake it, so send the same command once more rather
                 # than a wakeup of our own, which is rate limited and drains the
                 # service battery.
-                retry = self._commands_history[action_id].pop("retry")
-                name = self._commands_history[action_id]["name"]
+                retry = command.pop("retry")
+                command["resend_pending"] = True
                 _LOGGER.warning("Command '%s' to vehicle '%s' timed out, sending it once more in %ss", name, self._vehicle["vin"], COMMAND_RETRY_DELAY)
-                self._stellantis.do_async(self._resend_command(name, retry["service"], retry["message"]), COMMAND_RETRY_DELAY, wait=False)
+                self._stellantis.do_async(self._resend_command(action_id, retry), COMMAND_RETRY_DELAY, wait=False)
             if update not in COMMAND_STATUS_STILL_IN_PROGRESS and self._pending_action_id == action_id:
                 self._pending_action_id = None
+            notify_code = result_code if result_code is not None else update
+            if update in COMMAND_STATUS_SUCCESS:
+                self._dismiss_notification(self._command_notification_id(name))
+            elif notify_code in COMMAND_STATUS_NOTIFY and not will_resend and not command.get("internal"):
+                # Internal commands retry by themselves and report when they give up.
+                self._notify_command_failed(name, update)
+            if self._auto_clear_action_id is not None:
+                self._settle_auto_clear()
         self.async_update_listeners()
+
+    def _command_notification_id(self, name):
+        """ One notification per vehicle and command, replaced rather than stacked. """
+        slug = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+        return f"{DOMAIN}_{self._vehicle['vin'].lower()}_{slug}"
+
+    def _vehicle_display_name(self):
+        """ The device name the user gave the vehicle, or its VIN. """
+        try:
+            device = dr.async_get(self._hass).async_get_device(identifiers={(DOMAIN, self._vehicle["vin"], self._vehicle["type"])})
+            if device and (device.name_by_user or device.name):
+                return device.name_by_user or device.name
+        except Exception:
+            _LOGGER.debug("Could not look up the device name of vehicle '%s'", self._vehicle["vin"])
+        return self._vehicle["vin"]
+
+    def _notify_command_failed(self, name, status):
+        """ Tell the user that command name finally failed with status. """
+        label = self.get_translation(f"component.stellantis_vehicles.entity.sensor.command_status.state.{status}", status)
+        details = f"{self._vehicle_display_name()}: {name}: {label}"
+        self._stellantis.do_async(self._stellantis.hass_notify("command_error", self._command_notification_id(name), details), wait=False)
+
+    def _dismiss_notification(self, notification_id):
+        """ Dismiss a notification this coordinator created, if it is there. """
+        dismiss = getattr(self._stellantis, "hass_dismiss_notification", None)
+        if dismiss:
+            dismiss(notification_id)
 
     def update_command_history_rate_limit(self, name):
         current_datetime = get_datetime()
@@ -568,19 +658,55 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._prune_command_history()
         self.async_update_listeners()
 
-    async def _resend_command(self, name: str, service: str, message: dict[str, Any]) -> None:
+    async def _resend_command(self, action_id: str, retry: dict[str, Any]) -> None:
         """ Resend a timed out command. Runs in the background, so failures are logged, not raised. """
+        original = self._commands_history.get(action_id)
+        if original is None:
+            return
+        name = original["name"]
+        service, message = retry["service"], retry["message"]
+        # Program writes and clears carry asap "deactivate", which stops a
+        # running session. One sent while nothing ran must not stop a session
+        # that has started since. The clear button pressed during a run is
+        # meant to stop it, so that one is still resent.
+        if (
+            service == PRECONDITIONING_SERVICE
+            and message.get("asap") == PRECONDITIONING_PROGRAM_ASAP
+            and not retry.get("sent_while_running")
+            and self.preconditioning_is_running
+        ):
+            _LOGGER.warning("Preconditioning started on vehicle '%s' since command '%s' was sent, it is not sent again because that would stop the session", self._vehicle["vin"], name)
+            self._command_resend_failed(original)
+            return
         try:
-            await self.send_command(name, service, message)
+            new_action_id = await self.send_command(name, service, message, internal = original.get("internal", False))
         except Exception as err:
             _LOGGER.warning("Could not resend command '%s' to vehicle '%s': %s", name, self._vehicle["vin"], err)
+            self._command_resend_failed(original)
+            return
+        # resend_pending is dropped only now: until the resend is out, the
+        # command is still in progress (see _command_outcome).
+        original["resent_as"] = new_action_id
+        original.pop("resend_pending", None)
 
-    async def send_command(self, name: str, service: str, message: dict[str, Any], retry_on_timeout: bool = False) -> None:
-        """ Send a command to the vehicle.
+    def _command_resend_failed(self, original):
+        """ The resend of original did not go out: its timeout is final after all. """
+        original.pop("resend_pending", None)
+        if not original.get("internal"):
+            self._notify_command_failed(original["name"], "300")
+        if self._auto_clear_action_id is not None:
+            self._settle_auto_clear()
+        self.async_update_listeners()
+
+    async def send_command(self, name: str, service: str, message: dict[str, Any], retry_on_timeout: bool = False, internal: bool = False) -> str:
+        """ Send a command to the vehicle and return its action id.
 
         With retry_on_timeout the command is kept so it can be sent once more if
         the vehicle was asleep. Only use it for commands that set state and can
         therefore be sent twice without doing something twice.
+
+        internal marks a command the integration sent by itself and retries by
+        itself, so its failures are not notified one by one.
         """
         if self.pending_action:
             pending_name = self._commands_history[self._pending_action_id]["name"]
@@ -611,12 +737,15 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         # sent_at is the fallback pending_action uses before any update
         # has arrived yet (see pending_action).
         command = {"name": name, "updates": [], "service": service, "message": message, "retried": False, "sent_at": get_datetime()}
+        if internal:
+            command["internal"] = True
         if retry_on_timeout:
-            command["retry"] = {"service": service, "message": deepcopy(message)}
+            command["retry"] = {"service": service, "message": deepcopy(message), "sent_while_running": self.preconditioning_is_running}
         self._commands_history.update({action_id: command})
         self._prune_command_history()
         self._pending_action_id = action_id
         self.async_update_listeners()
+        return action_id
 
     @rate_limit(6, 1200) # 6 per 20 min
     async def send_wakeup_command(self, button_name):
@@ -648,8 +777,12 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         """ Send charge limit command to the vehicle. """
         await self.send_command(button_name, "/VehCharge/limit", {"action": action})
 
-    def get_programs(self, data = None):
-        """ Get current preconditioning programs, of data or of the last completed update. """
+    def get_programs(self, data = None, use_override = True):
+        """ Get current preconditioning programs, of data or of the last completed update.
+
+        Without use_override this is what the vehicle reports, ignoring what was
+        last written and not confirmed yet.
+        """
         default_programs = {
            "program1": {"day": [0, 0, 0, 0, 0, 0, 0], "hour": 34, "minute": 7, "on": 0},
            "program2": {"day": [0, 0, 0, 0, 0, 0, 0], "hour": 34, "minute": 7, "on": 0},
@@ -685,14 +818,45 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                     # such a program is deleted the next time any of them is sent.
                     self._dropped_programs.add(program.get("slot"))
                     _LOGGER.warning("Preconditioning program %s of vehicle '%s' has no weekday recurrence or no start time and cannot be read, it will be deleted by the next preconditioning command: %s", program.get("slot"), self._vehicle["vin"], program)
-        if self._programs_override:
-            expired = (get_datetime() - self._programs_override_at).total_seconds() > PRECONDITIONING_PROGRAMS_OVERRIDE_TTL
-            if expired or default_programs == self._programs_override:
+        if self._programs_override and use_override:
+            if default_programs == self._programs_override or not self._programs_override_is_current():
                 self._programs_override = None
                 self._programs_override_at = None
+                self._programs_override_action_id = None
             else:
                 return deepcopy(self._programs_override)
         return default_programs
+
+    def _programs_override_is_current(self):
+        """ Whether the last written programs still stand in for the vehicle data.
+
+        They do while the command that wrote them is in progress, including a
+        pending resend, and for a while after it completed, until the vehicle
+        reports them. Once it has finally failed they do not: the vehicle still
+        holds the old programs, and the entities must say so.
+        """
+        action_id = self._programs_override_action_id
+        if action_id is None:
+            return (get_datetime() - self._programs_override_at).total_seconds() <= PRECONDITIONING_PROGRAMS_OVERRIDE_TTL
+        outcome = self._command_outcome(action_id)
+        if outcome == "failed":
+            return False
+        if outcome == "complete":
+            command = self._final_command(action_id)
+            return (get_datetime() - self._command_last_activity(command)).total_seconds() <= PRECONDITIONING_PROGRAMS_OVERRIDE_TTL
+        return True
+
+    def _set_programs_override(self, programs, action_id):
+        """ Answer with programs until the vehicle reports them, see get_programs. """
+        self._programs_override = deepcopy(programs)
+        self._programs_override_at = get_datetime()
+        self._programs_override_action_id = action_id
+
+    @property
+    def programs_unconfirmed(self):
+        """ True while the program entities show a write the vehicle has not reported yet. """
+        self.get_programs()
+        return self._programs_override is not None
 
     async def send_preconditioning_command(self, button_name, action):
         """ Send preconditioning command to the vehicle. """
@@ -729,11 +893,12 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                     translation_key = "preconditioning_program_days_missing"
                 )
             programs[f"program{slot}"] = {"day": day, "hour": hour, "minute": minute, "on": int(on)}
-        await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs}, True)
-        self._programs_override = deepcopy(programs)
-        self._programs_override_at = get_datetime()
+        action_id = await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs}, True)
+        self._set_programs_override(programs, action_id)
+        # New programs: earlier failed clears say nothing about clearing these.
+        self._reset_auto_clear()
 
-    async def send_preconditioning_programs_clear(self, button_name, slots = None, data = None):
+    async def send_preconditioning_programs_clear(self, button_name, slots = None, data = None, internal = False):
         """ Reset preconditioning program slots to the disabled placeholder.
 
         Programs recur weekly, so a program written for a one off departure keeps
@@ -743,6 +908,11 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         The payload carries the same stop action the preconditioning stop button
         sends, so a press during a session cancels the session and clears the
         programs together, which is the point of pressing it then.
+
+        internal is the automatic clear. It is not resent after a timeout,
+        because it makes its own next attempt (see
+        _auto_clear_preconditioning_programs), and its failures are reported
+        only once it keeps failing.
         """
         if slots is None:
             slots = PRECONDITIONING_PROGRAM_SLOTS
@@ -754,9 +924,9 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                 "minute": PRECONDITIONING_PROGRAM_DISABLED_MINUTE,
                 "on": 0
             }
-        await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs}, True)
-        self._programs_override = deepcopy(programs)
-        self._programs_override_at = get_datetime()
+        action_id = await self.send_command(button_name, PRECONDITIONING_SERVICE, {"asap": PRECONDITIONING_PROGRAM_ASAP, "programs": programs}, not internal, internal)
+        self._set_programs_override(programs, action_id)
+        return action_id
 
     async def send_abrp_data(self, new_data: dict[str, Any]) -> None:
         """ Send vehicle data to ABRP. """
@@ -825,15 +995,34 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         await self._fetch_last_trip_on_engine_stop(new_data)
 
     async def _auto_clear_preconditioning_programs(self, new_data: dict[str, Any]) -> None:
-        """ Clear spent preconditioning program slots, when the switch for it is on. """
+        """ Clear spent preconditioning program slots, when the switch for it is on.
+
+        Runs only on an update that brought fresh vehicle data (see
+        _async_update_data), so an asleep vehicle is not sent anything. After a
+        failed attempt the next one waits, see PRECONDITIONING_AUTO_CLEAR_BACKOFF.
+        """
         if not self._sensors.get("switch_clear_programs_automatically", False):
             return
-        if not self.get_preconditioning_programs_are_set(new_data):
-            return
+        if self._auto_clear_action_id is not None:
+            self._settle_auto_clear()
+            if self._auto_clear_action_id is not None:
+                # the last attempt is still on its way
+                return
         # _sensors still holds the previous cycle here, the entities update after this
         is_running = self.get_preconditioning_is_running(new_data)
         run_ended = self._sensors.get("preconditioning") == "Enabled" and not is_running
         started_moving = (new_data.get("kinetic") or {}).get("moving") and not self._sensors.get("moving")
+        if not self.get_spent_program_slots(new_data, use_override = False) and not (
+            started_moving and self.get_preconditioning_programs_are_set(new_data, use_override = False)
+        ):
+            # The vehicle itself reports nothing left to clear.
+            self._reset_auto_clear()
+            return
+        if run_ended or started_moving:
+            # The vehicle has just been seen awake: try now, whatever failed before.
+            self._auto_clear_next_at = None
+        if not self.get_preconditioning_programs_are_set(new_data):
+            return
         # A slot is spent once its time has passed, whether or not the vehicle
         # ran for it: it has had its turn and would otherwise fire again on
         # the same weekday next week. Clearing only the spent ones leaves a
@@ -841,17 +1030,72 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         slots = PRECONDITIONING_PROGRAM_SLOTS if started_moving else self.get_spent_program_slots(new_data)
         if not slots or not (run_ended or started_moving or not is_running):
             return
+        if self._auto_clear_next_at is not None and get_datetime() < self._auto_clear_next_at:
+            return
         reason = "preconditioning stopped" if run_ended else ("the vehicle started moving" if started_moving else "their time has passed")
-        _LOGGER.debug("Clearing preconditioning program slots %s of vehicle '%s', %s", slots, self._vehicle["vin"], reason)
+        _LOGGER.debug("Clearing preconditioning program slots %s of vehicle '%s', %s (failed attempts so far: %s)", slots, self._vehicle["vin"], reason, self._auto_clear_failures)
         # Not the button's name: the command history has to show whether a
         # clear came from a press or from here.
         name = self.get_translation("component.stellantis_vehicles.entity.switch.clear_programs_automatically.name", "clear_programs_automatically")
         try:
-            await self.send_preconditioning_programs_clear(name, slots, new_data)
+            self._auto_clear_action_id = await self.send_preconditioning_programs_clear(name, slots, new_data, internal = True)
         except (HomeAssistantError, CommunicationError) as err:
             # Raising here would fail the whole update and discard the fresh data.
             # Nothing is lost: the slots are still spent on the next update.
             _LOGGER.warning("Could not clear the preconditioning programs of vehicle %s, retrying on the next update: %s", self._vehicle["vin"], err)
+
+    def _settle_auto_clear(self):
+        """ Book the outcome of the automatic clear in flight, once it has one. """
+        action_id = self._auto_clear_action_id
+        outcome = self._command_outcome(action_id)
+        if outcome == "in_progress":
+            return
+        self._auto_clear_action_id = None
+        command = self._final_command(action_id)
+        self._auto_clear_last_status = command["updates"][-1]["info"] if command and command["updates"] else None
+        if outcome == "complete":
+            # The vehicle took it. Whether it holds is seen in the vehicle data,
+            # which resets all of this once the slots are gone.
+            self._auto_clear_failures = 0
+            self._auto_clear_next_at = None
+            self._dismiss_notification(self._auto_clear_notification_id())
+            return
+        self._auto_clear_failures += 1
+        delay = PRECONDITIONING_AUTO_CLEAR_BACKOFF[min(self._auto_clear_failures, len(PRECONDITIONING_AUTO_CLEAR_BACKOFF)) - 1]
+        self._auto_clear_next_at = get_datetime() + timedelta(seconds = delay)
+        _LOGGER.warning("Clearing the preconditioning programs of vehicle '%s' failed (%s, %s in a row), trying again in %s minutes at the earliest", self._vehicle["vin"], self._auto_clear_last_status, self._auto_clear_failures, delay // 60)
+        if self._auto_clear_failures == PRECONDITIONING_AUTO_CLEAR_NOTIFY_AFTER:
+            name = self.get_translation("component.stellantis_vehicles.entity.switch.clear_programs_automatically.name", "clear_programs_automatically")
+            label = self.get_translation(f"component.stellantis_vehicles.entity.sensor.command_status.state.{self._auto_clear_last_status}", self._auto_clear_last_status)
+            details = f"{self._vehicle_display_name()}: {name}: {label} ({self._auto_clear_failures}x)"
+            self._stellantis.do_async(self._stellantis.hass_notify("auto_clear_failed", self._auto_clear_notification_id(), details), wait=False)
+
+    def _reset_auto_clear(self):
+        """ Forget earlier failed automatic clears. """
+        if self._auto_clear_failures or self._auto_clear_next_at is not None:
+            self._dismiss_notification(self._auto_clear_notification_id())
+        self._auto_clear_failures = 0
+        self._auto_clear_next_at = None
+
+    def _auto_clear_notification_id(self):
+        return f"{DOMAIN}_{self._vehicle['vin'].lower()}_auto_clear_failed"
+
+    @property
+    def auto_clear_state(self):
+        """ State of the automatic clear, for the attributes of its switch. """
+        if self._auto_clear_action_id is not None:
+            state = "sending"
+        elif self._auto_clear_next_at is not None:
+            state = "waiting"
+        else:
+            state = "idle"
+        return {
+            "state": state,
+            "failed_attempts": self._auto_clear_failures,
+            "last_status": self._auto_clear_last_status,
+            "next_attempt": self._auto_clear_next_at.isoformat() if self._auto_clear_next_at else None,
+            "programs_unconfirmed": self.programs_unconfirmed
+        }
 
     async def _auto_stop_charge_at_limit(self) -> None:
         """ Send a delayed charge-stop command once the configured limit is reached. """

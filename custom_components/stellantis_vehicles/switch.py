@@ -52,7 +52,7 @@ async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> No
                     icon = "mdi:calendar-remove-outline",
                     entity_category = EntityCategory.CONFIG
                 )
-                entities.extend([StellantisBaseSwitch(coordinator, description, True)])
+                entities.extend([StellantisAutoClearSwitch(coordinator, description, True)])
 
             description = SwitchEntityDescription(
                 name = "abrp_sync",
@@ -87,7 +87,19 @@ class StellantisAbrpSyncSwitch(StellantisBaseSwitch):
         return super().available and self._coordinator._sensors.get("text_abrp_token") and len(self._coordinator._sensors.get("text_abrp_token")) == 36
 
 
+class StellantisAutoClearSwitch(StellantisBaseSwitch):
+    @property
+    def extra_state_attributes(self):
+        """ Where the automatic clear stands: sending, waiting after a failure, or idle. """
+        return {**self._attr_extra_state_attributes, **self._coordinator.auto_clear_state}
+
+
 class StellantisPreconditioningProgramSwitch(StellantisPreconditioningProgramEntity, StellantisBaseSwitch):
+    @property
+    def extra_state_attributes(self):
+        """ confirmed is false while the state shows a write or clear the vehicle has not reported yet. """
+        return {**self._attr_extra_state_attributes, "confirmed": not self._coordinator.programs_unconfirmed}
+
     @property
     def is_on(self):
         """ Is on. """

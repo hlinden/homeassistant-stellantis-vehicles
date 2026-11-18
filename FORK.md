@@ -17,6 +17,7 @@ does and what was measured on a real car.
 | Clear the preconditioning programs automatically | a switch, on by default, clearing after a run ends or when the car starts moving |
 | Write several program slots in one command | batch writes, and the override that stops two quick writes racing each other |
 | Document what the vehicle actually does | the measured behaviour |
+| Retry the automatic clear with a backoff | backoff and fresh data only for the automatic clear, an override that follows its command, no resend into a running session, one notification per command |
 
 ## Files this fork touches
 
@@ -27,10 +28,12 @@ Changed, so upstream edits to these can conflict:
 - `custom_components/stellantis_vehicles/base.py`
 - `custom_components/stellantis_vehicles/button.py`
 - `custom_components/stellantis_vehicles/const.py`
+- `custom_components/stellantis_vehicles/stellantis.py` (`hass_notify` and the result-code branch of `_on_mqtt_message`)
 - `custom_components/stellantis_vehicles/switch.py`
 - `custom_components/stellantis_vehicles/text.py`
 - `custom_components/stellantis_vehicles/time.py`
 - `custom_components/stellantis_vehicles/translations/en.json`
+- `custom_components/stellantis_vehicles/translations/de.json`
 - `custom_components/stellantis_vehicles/utils.py`
 - `hacs.json`
 
@@ -43,6 +46,7 @@ Added, so they never conflict:
 - `tests_fork/run_all.sh`
 - `tests_fork/stub.py`
 - `tests_fork/test_auto_clear.py`
+- `tests_fork/test_auto_clear_retry.py`
 - `tests_fork/test_batch_write.py`
 - `tests_fork/test_clear_programs.py`
 - `tests_fork/test_command_retry.py`
@@ -76,9 +80,9 @@ After pushing, Redownload in HACS and restart Home Assistant.
 
 ## Checking it still works
 
-`./tests_fork/run_all.sh` runs seven offline suites covering the payload, the entities,
-the service, the clear button, the automatic clearing, the batch write and the
-resend after a timeout. They
+`./tests_fork/run_all.sh` runs eight offline suites covering the payload, the entities,
+the service, the clear button, the automatic clearing, the batch write, the
+resend after a timeout, and the backoff and notifications of failed commands. They
 need no Home Assistant install: `tests_fork/stub.py` fabricates the modules the code
 imports. Run them after every merge.
 

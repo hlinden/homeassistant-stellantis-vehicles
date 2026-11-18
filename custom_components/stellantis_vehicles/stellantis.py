@@ -385,8 +385,12 @@ class StellantisBase:
         future = asyncio.run_coroutine_threadsafe(delayed_execution(), self._hass.loop)
         return future.result() if wait else None
 
-    async def hass_notify(self, translation_key):
-        """Create a persistent notification."""
+    async def hass_notify(self, translation_key, notification_id=None, details=None):
+        """Create a persistent notification.
+
+        A notification_id replaces an earlier notification with the same id
+        instead of adding another one. details is appended to the message.
+        """
         if hasattr(self, '_entry') and not self.get_stored_config(FIELD_NOTIFICATIONS):
             return
 
@@ -395,6 +399,8 @@ class StellantisBase:
         if translations.get(f"component.stellantis_vehicles.common.{translation_key}_title", None):
             notification_title = notification_title + " - " + str(translations.get(f"component.stellantis_vehicles.common.{translation_key}_title", None))
         notification_message = str(translations.get(f"component.stellantis_vehicles.common.{translation_key}_message", None))
+        if details:
+            notification_message = notification_message + "\n\n" + str(details)
 
         notification_title = replace_string_placeholders(notification_title, TRANSLATION_PLACEHOLDERS)
         notification_message = replace_string_placeholders(notification_message, TRANSLATION_PLACEHOLDERS)
@@ -403,8 +409,12 @@ class StellantisBase:
             self._hass,
             notification_message,
             title=notification_title,
-            notification_id=str(uuid4())
+            notification_id=notification_id or str(uuid4())
         )
+
+    def hass_dismiss_notification(self, notification_id):
+        """Dismiss a persistent notification, if it is shown."""
+        persistent_notification.async_dismiss(self._hass, notification_id)
 
 
 class StellantisOauth(StellantisBase):
@@ -1188,9 +1198,9 @@ class StellantisVehicles(StellantisOauth):
                     if result_code == "113":  # Error: vin (https://github.com/andreadegiovine/homeassistant-stellantis-vehicles/issues/388)
                         result_code = "failed"
                     # wait=False: fire-and-forget so the paho network thread isn't
-                    # blocked (the results aren't used here anyway)
-                    if result_code in ["300", "500", "not_compatible", "failed"]:
-                        self.do_async(self.hass_notify("command_error"), wait=False)
+                    # blocked (the results aren't used here anyway).
+                    # Failures are notified by update_command_history, which knows
+                    # whether the command is about to be resent.
                     if result_code == "0":
                         _LOGGER.debug("Fetching updates after result code %s", result_code)
                         self.do_async(coordinator.async_refresh(), 10, wait=False)
@@ -1206,7 +1216,7 @@ class StellantisVehicles(StellantisOauth):
                         pending_command = coordinator._commands_history.get(data["correlation_id"])
                         service = pending_command.get("service") if pending_command else None
                         history_code = resolve_mqtt_resp_data_error(service, resp_data, result_code)
-                    self.do_async(coordinator.update_command_history(data["correlation_id"], history_code), wait=False)
+                    self.do_async(coordinator.update_command_history(data["correlation_id"], history_code, result_code), wait=False)
                 else:
                     _LOGGER.error("No result code")
 

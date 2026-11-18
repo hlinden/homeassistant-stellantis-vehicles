@@ -237,14 +237,32 @@ PRECONDITIONING_PROGRAM_DISABLED_MINUTE = 7
 # preconditioning is on.
 PRECONDITIONING_PROGRAM_ASAP = "deactivate"
 
-# The vehicle needs a while to report a program back. Until it does, or until
-# this many seconds pass, get_programs() answers with what was last written, so
-# that two writes in a row do not build their payloads from the same stale data.
+# The vehicle needs a while to report a program back. Until it does,
+# get_programs() answers with what was last written, so that two writes in a
+# row do not build their payloads from the same stale data. The override
+# follows the command that wrote it: it is dropped as soon as that command
+# finally fails, and otherwise after this many seconds without news of it (no
+# status while in progress, or the vehicle data not following a Complete).
 PRECONDITIONING_PROGRAMS_OVERRIDE_TTL = 300
 
 # A command sent to a sleeping vehicle can come back as a timeout, and is then
 # lost. Program writes are resent once after this many seconds.
 COMMAND_RETRY_DELAY = 30
+
+# Seconds the automatic clear waits after a failed attempt before the next
+# one, by number of failures so far; the last step repeats. An attempt is only
+# made on an update that brought fresh vehicle data, so an asleep vehicle is
+# not sent anything. Measured: clears timed out for 50 minutes after a run and
+# then went through, so retrying is worth it, but every command makes the
+# platform try a wakeup, which is rate limited and drains the service battery.
+PRECONDITIONING_AUTO_CLEAR_BACKOFF = (300, 900, 1800)
+
+# Failed automatic clears in a row after which the user is notified. Earlier
+# failures are not reported: the next attempt is already scheduled.
+PRECONDITIONING_AUTO_CLEAR_NOTIFY_AFTER = 4
+
+# result codes that end a command unsuccessfully and are reported to the user
+COMMAND_STATUS_NOTIFY = ("300", "500", "not_compatible", "failed")
 
 SERVICE_SET_PRECONDITIONING_PROGRAM = "set_preconditioning_program"
 

@@ -18,8 +18,8 @@ class C(base.StellantisVehicleCoordinator):
     def __init__(self, d):
         self.data = d; self._vehicle = {"vin":"VIN1","type":"Electric"}
         self._sensors = {}; self._dropped_programs = set(); self.sent = []
-        self._programs_override = None; self._programs_override_at = None
-    async def send_command(self, n, s, m, retry=False): self.sent.append((n, s, m))
+        self._programs_override = None; self._programs_override_at = None; self._programs_override_action_id = None; self._auto_clear_action_id = None; self._auto_clear_failures = 0; self._auto_clear_next_at = None; self._auto_clear_last_status = None
+    async def send_command(self, n, s, m, retry=False, internal=False): self.sent.append((n, s, m))
     async def async_refresh(self): pass
     def get_translation(self, p, d=None): return d
 

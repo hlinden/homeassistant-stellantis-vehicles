@@ -19,10 +19,16 @@ class FakeStellantis:
         self.action = 0
         self.sent = []
         self.scheduled = []
+        self.notified = []
+        self.dismissed = []
     async def send_mqtt_message(self, service, message, vehicle):
         self.action += 1
         self.sent.append((service, message))
         return f"action{self.action}"
+    async def hass_notify(self, key, notification_id=None, details=None):
+        self.notified.append((key, notification_id, details))
+    def hass_dismiss_notification(self, notification_id):
+        self.dismissed.append(notification_id)
     def do_async(self, coro, delay=0, wait=True):
         # run the retry now instead of after the delay
         self.scheduled.append(delay)
@@ -38,8 +44,10 @@ class C(base.StellantisVehicleCoordinator):
         self._pending_action_id = None
         self._disabled_commands = []
         self._programs_override = None
-        self._programs_override_at = None
+        self._programs_override_at = None; self._programs_override_action_id = None; self._auto_clear_action_id = None; self._auto_clear_failures = 0; self._auto_clear_next_at = None; self._auto_clear_last_status = None
         self._stellantis = FakeStellantis()
+        self._translations = {}
+        self._hass = None
     def async_update_listeners(self):
         pass
 
